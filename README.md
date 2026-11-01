@@ -1,5 +1,12 @@
 # Hunger & Thirst (mod-hunger-thirst)
 
+[![core-build](https://github.com/Phanty78/mod-hunger-thirst/actions/workflows/core-build.yml/badge.svg?branch=main)](https://github.com/Phanty78/mod-hunger-thirst/actions/workflows/core-build.yml)
+[![Codestyle Checks](https://github.com/Phanty78/mod-hunger-thirst/actions/workflows/core_codestyle.yml/badge.svg?branch=main)](https://github.com/Phanty78/mod-hunger-thirst/actions/workflows/core_codestyle.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+<!-- TODO: capture d'écran réelle des jauges de satiété/hydratation (addon client).
+     Aucune capture vérifiée n'est disponible à ce jour ; ne pas illustrer avec une image générique. -->
+
 ## Description
 
 Hunger & Thirst is a standalone [AzerothCore](https://www.azerothcore.org/) module for World of Warcraft: Wrath of the Lich King 3.3.5a. It gives every character a satiety gauge and a hydration gauge, both running from 0 to 100. The gauges fall over time and are restored by eating and drinking. In `survival` mode, low satiety shows a visible hunger state and low hydration a visible thirst state, two debuffs that weaken the character. Neither gauge ever removes health or kills the character.
