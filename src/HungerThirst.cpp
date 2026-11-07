@@ -796,7 +796,12 @@ namespace HungerThirst
         cfg.InstanceMultiplier = ClampRange(
             sConfigMgr->GetOption<float>("HungerThirst.InstanceMultiplier", 1.00),
             0.00, 10.00, "InstanceMultiplier");
-
+        cfg.GroundMountMultiplier = ClampRange(
+            sConfigMgr->GetOption<float>("HungerThirst.GroundMountMultiplier", 2.00),
+            0.00, 10.00, "GroundMountMultiplier");
+        cfg.FlyingMountMultiplier = ClampRange(
+            sConfigMgr->GetOption<float>("HungerThirst.FlyingMountMultiplier", 3.00),
+            0.00, 10.00, "FlyingMountMultiplier");
         cfg.PauseOnTaxi = sConfigMgr->GetOption<bool>("HungerThirst.PauseOnTaxi", true);
         cfg.PauseInBattleground = sConfigMgr->GetOption<bool>("HungerThirst.PauseInBattleground", true);
         cfg.PauseInArena = sConfigMgr->GetOption<bool>("HungerThirst.PauseInArena", true);
@@ -1174,12 +1179,20 @@ namespace HungerThirst
         bool const resting = player->HasRestFlag(REST_FLAG_IN_TAVERN) ||
                              player->HasRestFlag(REST_FLAG_IN_CITY) ||
                              player->HasRestFlag(REST_FLAG_IN_FACTION_AREA);
-
+        bool const OnMount = player->IsMounted();
+        bool const OnFlyingMount = player->IsFlying();
         double multiplier = 1.00;
         if (resting)
             multiplier *= cfg.RestMultiplier;
         if (inDungeon)
             multiplier *= cfg.InstanceMultiplier;
+        if(OnMount && !OnFlyingMount){
+            multiplier *= cfg.GroundMountMultiplier;
+        }
+        if(OnFlyingMount){
+            multiplier *= cfg.FlyingMountMultiplier;
+        }
+        
 
         uint32 const guid = player->GetGUID().GetCounter();
 

@@ -41,6 +41,8 @@ struct Config
     double HydrationDecayPerMinute = 0.75;
     double RestMultiplier          = 0.50;
     double InstanceMultiplier      = 1.00;
+    double GroundMountMultiplier   = 2.00;
+    double FlyingMountMultiplier   = 3.00;
     bool   PauseOnTaxi             = true;
     bool   PauseInBattleground     = true;
     bool   PauseInArena            = true;

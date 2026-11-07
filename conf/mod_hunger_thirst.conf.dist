@@ -173,6 +173,24 @@ HungerThirst.RestMultiplier = 0.50
 HungerThirst.InstanceMultiplier = 1.00
 
 #
+#    HungerThirst.FlyingMountMultiplier
+#        Decay multiplier while on a flying mount
+#        Stacks with other multipliers
+#        Clamped to 0..10.
+#        Default: 3.00
+#
+HungerThirst.FlyingMountMultiplier = 3.00
+
+#
+#    HungerThirst.GroundMountMultiplier
+#        Decay multiplier while inside a dungeon or raid map
+#        Stacks with other multipliers
+#        rest area is also an instance. Clamped to 0..10.
+#        Default: 2.00
+#
+HungerThirst.GroundMountMultiplier = 2.00
+
+#
 #    HungerThirst.PauseOnTaxi
 #        Suspend decay, warnings and the thirst blur while the player is on a
 #        taxi flight. Thirst state auras already applied stay in place.
