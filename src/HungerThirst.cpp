@@ -23,10 +23,14 @@
 
 #include "HungerThirst.h"
 
+#include "CellImpl.h"
 #include "Chat.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
+#include "GameObject.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "Log.h"
 #include "Map.h"
 #include "ObjectGuid.h"
@@ -50,6 +54,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -87,6 +92,19 @@ namespace HungerThirst
         constexpr uint32 MinBlurDurationMs           = 100;
         constexpr int32  ThirstBlurValueThirsty      = 35;
         constexpr int32  ThirstBlurValueDehydrated   = 45;
+
+        // Cold exposure. The stock "Chilled" spell is applied to the player
+        // and only the aura whose caster is the player is managed here, so a
+        // chill cast by a creature is never removed. Its stock slow is used
+        // as-is; the spell data is not patched.
+        constexpr uint32 SpellColdId               = 6136; // "Chilled"
+        constexpr uint32 ColdAuraDurationMs        = 15000;
+        constexpr uint32 ColdFireCheckIntervalMs   = 5000;
+        constexpr uint32 ColdDrainIntervalDefaultMs = 5000;
+        constexpr uint32 ColdFireFocusId           = 4;    // SPELL_FOCUS cooking fire
+        constexpr float  ColdFireRange             = 8.0f;
+        constexpr double ColdAuraThreshold         = 75.00;
+        constexpr double ColdDrainThreshold        = 100.00;
 
         // Blizzard spells that no content references any more, repurposed as
         // the hunger and thirst state debuffs. They are patched on the server
@@ -254,11 +272,18 @@ namespace HungerThirst
         {
             double Satiety         = MaxGaugeValue;
             double Hydration       = MaxGaugeValue;
+            double Cold            = MinGaugeValue;
             bool   Loaded          = false;
             bool   Dirty           = false;
             uint64 UpdatedAtMs     = 0;
             Band   SatietyBand     = Band::Normal;
             Band   HydrationBand   = Band::Normal;
+            Band   ColdBand        = Band::Normal;
+            bool   HotActive       = false;
+            uint32 ColdDrainTimerMs = 0;
+            uint32 FireCheckTimerMs = 0;
+            bool   AtFire          = false;
+            bool   ColdDrainNotified = false;
             uint64 AddonTimerMs    = 0;
             uint64 BlurTimerMs     = 0;
             uint32 BlurRemainingMs = 0;
@@ -320,6 +345,25 @@ namespace HungerThirst
                 LOG_ERROR("module.hunger-thirst", "HungerThirst.{} = {} ms is below the minimum of {} ms; clamping.",
                     key, value, MinIntervalMs);
                 return MinIntervalMs;
+            }
+
+            return value;
+        }
+
+        uint32 ClampSeconds(uint32 value, char const* key)
+        {
+            if (value < 30)
+            {
+                LOG_ERROR("module.hunger-thirst",
+                    "HungerThirst.{} = {} s is below the minimum of 30 s; clamping.", key, value);
+                return 30;
+            }
+
+            if (value > 86400)
+            {
+                LOG_ERROR("module.hunger-thirst",
+                    "HungerThirst.{} = {} s is above the maximum of 86400 s; clamping.", key, value);
+                return 86400;
             }
 
             return value;
@@ -413,6 +457,199 @@ namespace HungerThirst
             }
 
             return nullptr;
+        }
+
+        // Cold uses fixed thresholds (25/50/75 %) and its own band labels.
+        // Reusing Band keeps the addon protocol numeric and stable.
+        Band RawColdBand(double value)
+        {
+            if (value >= 75.00)
+                return Band::Empty;
+
+            if (value >= 50.00)
+                return Band::Critical;
+
+            if (value >= 25.00)
+                return Band::Warning;
+
+            return Band::Normal;
+        }
+
+        // Cold worsens upward. The band only improves once the gauge drops
+        // below the current band's exit threshold, minus Hysteresis.
+        Band ResolveColdBand(double value, Band current, Config const& cfg)
+        {
+            Band const raw = RawColdBand(value);
+
+            if (raw > current)
+                return raw;
+
+            if (raw == current)
+                return current;
+
+            double exitAt = 0.00;
+            switch (current)
+            {
+                case Band::Empty:
+                    exitAt = 75.00;
+                    break;
+                case Band::Critical:
+                    exitAt = 50.00;
+                    break;
+                case Band::Warning:
+                    exitAt = 25.00;
+                    break;
+                case Band::Normal:
+                    return raw;
+            }
+
+            return value < (exitAt - cfg.Hysteresis) ? raw : current;
+        }
+
+        char const* ColdBandMessage(Band band)
+        {
+            switch (band)
+            {
+                case Band::Warning:
+                    return "You are starting to feel cold. Seek shelter or a fire.";
+                case Band::Critical:
+                    return "You are cold. Seek shelter or a fire.";
+                case Band::Empty:
+                    return "The cold is slowing you down. Seek shelter or a cooking fire.";
+                case Band::Normal:
+                    break;
+            }
+
+            return nullptr;
+        }
+
+        bool IsInstanceMap(Player* player)
+        {
+            return player->GetMap() && player->GetMap()->Instanceable();
+        }
+
+        // Remove only the "Chilled" aura applied by the player. A creature's
+        // chill has a different caster GUID and must be left untouched.
+        void RemoveColdAura(Player* player)
+        {
+            if (!player)
+                return;
+
+            if (Aura* aura = player->GetAura(SpellColdId, player->GetGUID()))
+                aura->Remove();
+        }
+
+        void ApplyColdAura(Player* player, bool desired)
+        {
+            if (!player)
+                return;
+
+            Aura* own = player->GetAura(SpellColdId, player->GetGUID());
+
+            if (!desired)
+            {
+                if (own)
+                    own->Remove();
+                return;
+            }
+
+            if (own)
+            {
+                own->SetMaxDuration(ColdAuraDurationMs);
+                own->SetDuration(ColdAuraDurationMs);
+                return;
+            }
+
+            // A chill from another caster is already on the player; do not
+            // stack a second copy or override its remaining duration.
+            if (player->HasAura(SpellColdId))
+                return;
+
+            if (Aura* aura = player->AddAura(SpellColdId, player))
+            {
+                aura->SetMaxDuration(ColdAuraDurationMs);
+                aura->SetDuration(ColdAuraDurationMs);
+            }
+        }
+
+        // Applies one or more 5-second cold drain intervals at once, with a
+        // 1 % max-health floor. The drain can never kill on its own.
+        void ApplyColdHealthDrain(Player* player, uint32 intervals, double pct)
+        {
+            if (!player || !intervals || pct <= 0.00)
+                return;
+
+            uint32 const maxHealth = player->GetMaxHealth();
+            if (!maxHealth)
+                return;
+
+            uint32 const floor = std::max<uint32>(1, (maxHealth + 99) / 100);
+            uint32 const health = player->GetHealth();
+            if (health <= floor)
+                return;
+
+            uint64 const perInterval = std::max<uint64>(1, uint64(maxHealth) * pct / 100.0);
+            uint64 const total = perInterval * intervals;
+            uint32 const drained = health > total ? uint32(health - total) : 0;
+            uint32 const newHealth = std::max(floor, drained);
+
+            if (newHealth < health)
+                player->SetHealth(newHealth);
+        }
+
+        bool IsDrinking(Player* player)
+        {
+            for (auto const& entry : player->GetAppliedAuras())
+            {
+                Aura* aura = entry.second->GetBase();
+                if (!aura || aura->GetCastItemGUID().IsEmpty())
+                    continue;
+
+                SpellSpecificType const specific = aura->GetSpellInfo()->GetSpellSpecific();
+                if (specific == SPELL_SPECIFIC_DRINK || specific == SPELL_SPECIFIC_FOOD_AND_DRINK)
+                    return true;
+            }
+
+            return false;
+        }
+
+        bool IsNearWarmFire(Player* player, Config const& cfg)
+        {
+            GameObject* fire = nullptr;
+
+            auto isWarmFire = [player, &cfg](GameObject* object)
+            {
+                if (!object || !object->isSpawned() || !object->GetGOInfo())
+                    return false;
+
+                bool const cookingFire = object->GetGoType() == GAMEOBJECT_TYPE_SPELL_FOCUS
+                    && object->GetGOInfo()->spellFocus.focusId == ColdFireFocusId;
+                bool const listed = cfg.ColdFires.count(object->GetEntry()) != 0;
+
+                return (cookingFire || listed)
+                    && player->IsWithinDistInMap(object, ColdFireRange)
+                    && player->IsWithinLOSInMap(object);
+            };
+
+            Acore::GameObjectLastSearcher<decltype(isWarmFire)> searcher(player, fire, isWarmFire);
+            Cell::VisitObjects(player, searcher, ColdFireRange);
+            return fire != nullptr;
+        }
+
+        std::unordered_set<uint32> ParseIdSet(std::string text)
+        {
+            std::replace(text.begin(), text.end(), ',', ' ');
+
+            std::istringstream input(text);
+            std::unordered_set<uint32> ids;
+            uint32 value = 0;
+            while (input >> value)
+            {
+                if (value)
+                    ids.insert(value);
+            }
+
+            return ids;
         }
 
         void SendChatLine(Player* player, std::string_view message)
@@ -870,6 +1107,30 @@ namespace HungerThirst
         cfg.StartingHydration = ClampRange(
             sConfigMgr->GetOption<float>("HungerThirst.StartingHydration", 100.00),
             0.00, 100.00, "StartingHydration");
+        cfg.StartingCold = ClampRange(
+            sConfigMgr->GetOption<float>("HungerThirst.StartingCold", 0.00),
+            0.00, 100.00, "StartingCold");
+
+        cfg.ExposureEnable = sConfigMgr->GetOption<bool>("HungerThirst.ExposureEnable", true);
+        cfg.ColdZones = ParseIdSet(sConfigMgr->GetOption<std::string>(
+            "HungerThirst.ColdZones", "1,65,67,210,618"));
+        cfg.HotZones = ParseIdSet(sConfigMgr->GetOption<std::string>(
+            "HungerThirst.HotZones", "3,46,51,440,3483"));
+        cfg.ColdFires = ParseIdSet(sConfigMgr->GetOption<std::string>(
+            "HungerThirst.ColdCampfireEntries", "2061"));
+        cfg.ColdSeconds = ClampSeconds(
+            sConfigMgr->GetOption<uint32>("HungerThirst.ColdSeconds", 600), "ColdSeconds");
+        cfg.WarmSeconds = ClampSeconds(
+            sConfigMgr->GetOption<uint32>("HungerThirst.WarmSeconds", 120), "WarmSeconds");
+        cfg.ColdDrainIntervalMs = ClampInterval(
+            sConfigMgr->GetOption<uint32>("HungerThirst.ColdDrainIntervalMs", ColdDrainIntervalDefaultMs),
+            "ColdDrainIntervalMs");
+        cfg.ColdHealthDrainPct = ClampRange(
+            sConfigMgr->GetOption<float>("HungerThirst.ColdHealthDrainPct", 1.00),
+            0.00, 100.00, "ColdHealthDrainPct");
+        cfg.HotHydrationMultiplier = ClampRange(
+            sConfigMgr->GetOption<float>("HungerThirst.HotHydrationMultiplier", 2.00),
+            1.00, 10.00, "HotHydrationMultiplier");
 
         double const maxHysteresis = std::max(0.00, MaxGaugeValue - double(cfg.WarningThreshold));
         cfg.Hysteresis = ClampRange(
@@ -889,8 +1150,10 @@ namespace HungerThirst
             cfg.AddonPrefix = "HT";
         }
 
-        LOG_INFO("module.hunger-thirst", "Configuration {}: enable {}, mode {}, addon {}.",
-            reload ? "reloaded" : "loaded", cfg.Enable, ModeName(cfg.CurrentMode), cfg.AddonEnable);
+        LOG_INFO("module.hunger-thirst",
+            "Configuration {}: enable {}, mode {}, addon {}, exposure {} ({} cold zones, {} hot zones).",
+            reload ? "reloaded" : "loaded", cfg.Enable, ModeName(cfg.CurrentMode), cfg.AddonEnable,
+            cfg.ExposureEnable, cfg.ColdZones.size(), cfg.HotZones.size());
     }
 
     void EnsureSchema()
@@ -904,20 +1167,36 @@ namespace HungerThirst
             "`guid` INT UNSIGNED NOT NULL, "
             "`satiety` DECIMAL(5,2) NOT NULL DEFAULT 100.00, "
             "`hydration` DECIMAL(5,2) NOT NULL DEFAULT 100.00, "
+            "`cold` DECIMAL(5,2) NOT NULL DEFAULT 0.00, "
             "`updated_at` BIGINT UNSIGNED NOT NULL DEFAULT 0, "
             "PRIMARY KEY (`guid`)"
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
 
-        // An empty table makes the probe return no row even though the table
-        // exists, so COUNT(*) is used to distinguish "empty" from
-        // "missing/DB error" (it always returns exactly one row on success).
-        bool ready = static_cast<bool>(CharacterDatabase.Query(
-            "SELECT 1 FROM `hunger_thirst_state` LIMIT 1"));
+        // Existing installations predate the cold column. CREATE TABLE IF NOT
+        // EXISTS does not alter them, so add the column explicitly when it is
+        // missing. information_schema is used instead of relying on a
+        // vendor-specific ADD COLUMN IF NOT EXISTS.
+        QueryResult column = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM `information_schema`.`COLUMNS` "
+            "WHERE `TABLE_SCHEMA` = DATABASE() "
+            "AND `TABLE_NAME` = 'hunger_thirst_state' "
+            "AND `COLUMN_NAME` = 'cold'");
 
-        if (!ready)
+        bool schemaOk = static_cast<bool>(column);
+        if (schemaOk && column->Fetch()->Get<uint64>() == 0)
+        {
+            CharacterDatabase.DirectExecute(
+                "ALTER TABLE `hunger_thirst_state` "
+                "ADD COLUMN `cold` DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER `hydration`");
+        }
+
+        // COUNT(cold) both proves the table exists and proves the column is
+        // readable; an empty table still returns one row.
+        bool ready = false;
+        if (schemaOk)
         {
             ready = static_cast<bool>(CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM `hunger_thirst_state`"));
+                "SELECT COUNT(`cold`) FROM `hunger_thirst_state`"));
         }
 
         g_persistenceReady.store(ready);
@@ -961,8 +1240,10 @@ namespace HungerThirst
         State state;
         state.Satiety = ClampGauge(cfg.StartingSatiety);
         state.Hydration = ClampGauge(cfg.StartingHydration);
+        state.Cold = ClampGauge(cfg.StartingCold);
         state.SatietyBand = RawBand(state.Satiety, cfg);
         state.HydrationBand = RawBand(state.Hydration, cfg);
+        state.ColdBand = RawColdBand(state.Cold);
         state.Loaded = false;
         state.Dirty = false;
 
@@ -976,16 +1257,19 @@ namespace HungerThirst
         }
 
         QueryResult row = CharacterDatabase.Query(
-            "SELECT `satiety`, `hydration`, `updated_at` FROM `hunger_thirst_state` WHERE `guid` = {}", guid);
+            "SELECT `satiety`, `hydration`, `cold`, `updated_at` "
+            "FROM `hunger_thirst_state` WHERE `guid` = {}", guid);
 
         if (row)
         {
             Field* fields = row->Fetch();
             state.Satiety = ClampGauge(fields[0].Get<double>());
             state.Hydration = ClampGauge(fields[1].Get<double>());
-            state.UpdatedAtMs = fields[2].Get<uint64>();
+            state.Cold = ClampGauge(fields[2].Get<double>());
+            state.UpdatedAtMs = fields[3].Get<uint64>();
             state.SatietyBand = RawBand(state.Satiety, cfg);
             state.HydrationBand = RawBand(state.Hydration, cfg);
+            state.ColdBand = RawColdBand(state.Cold);
             state.Loaded = true;
             state.Dirty = false;
         }
@@ -1030,8 +1314,8 @@ namespace HungerThirst
         if (cfg.DebugLog)
         {
             LOG_DEBUG("module.hunger-thirst",
-                "Loaded state for {} ({}): satiety {:.2f}, hydration {:.2f}, updated_at {}.",
-                player->GetName(), guid, state.Satiety, state.Hydration, state.UpdatedAtMs);
+                "Loaded state for {} ({}): satiety {:.2f}, hydration {:.2f}, cold {:.2f}, updated_at {}.",
+                player->GetName(), guid, state.Satiety, state.Hydration, state.Cold, state.UpdatedAtMs);
         }
 
         return true;
@@ -1049,6 +1333,7 @@ namespace HungerThirst
         uint32 const guid = player->GetGUID().GetCounter();
         double satiety = 0.00;
         double hydration = 0.00;
+        double cold = 0.00;
         uint64 updatedAt = 0;
 
         {
@@ -1063,6 +1348,7 @@ namespace HungerThirst
 
             satiety = state.Satiety;
             hydration = state.Hydration;
+            cold = state.Cold;
             updatedAt = std::max<uint64>(NowMs(), state.UpdatedAtMs + 1);
             state.UpdatedAtMs = updatedAt;
             state.Dirty = false;
@@ -1073,23 +1359,24 @@ namespace HungerThirst
         // GM commands) run synchronously so an immediate reconnect cannot
         // read the stale row; periodic saves stay asynchronous.
         char const* const query =
-            "INSERT INTO `hunger_thirst_state` (`guid`, `satiety`, `hydration`, `updated_at`) "
-            "VALUES ({}, {}, {}, {}) "
+            "INSERT INTO `hunger_thirst_state` (`guid`, `satiety`, `hydration`, `cold`, `updated_at`) "
+            "VALUES ({}, {}, {}, {}, {}) "
             "ON DUPLICATE KEY UPDATE "
             "`satiety` = IF(VALUES(`updated_at`) >= `updated_at`, VALUES(`satiety`), `satiety`), "
             "`hydration` = IF(VALUES(`updated_at`) >= `updated_at`, VALUES(`hydration`), `hydration`), "
+            "`cold` = IF(VALUES(`updated_at`) >= `updated_at`, VALUES(`cold`), `cold`), "
             "`updated_at` = GREATEST(`updated_at`, VALUES(`updated_at`))";
 
         if (force)
-            CharacterDatabase.DirectExecute(query, guid, satiety, hydration, updatedAt);
+            CharacterDatabase.DirectExecute(query, guid, satiety, hydration, cold, updatedAt);
         else
-            CharacterDatabase.Execute(query, guid, satiety, hydration, updatedAt);
+            CharacterDatabase.Execute(query, guid, satiety, hydration, cold, updatedAt);
 
         if (cfg.DebugLog)
         {
             LOG_DEBUG("module.hunger-thirst",
-                "Saved state for guid {}: satiety {:.2f}, hydration {:.2f}, updated_at {}.",
-                guid, satiety, hydration, updatedAt);
+                "Saved state for guid {}: satiety {:.2f}, hydration {:.2f}, cold {:.2f}, updated_at {}.",
+                guid, satiety, hydration, cold, updatedAt);
         }
     }
 
@@ -1099,7 +1386,9 @@ namespace HungerThirst
             return;
 
         // The client field is not persisted: restore it before the state row
-        // is dropped so a reconnect starts clean.
+        // is dropped so a reconnect starts clean. The cold aura is ours, not a
+        // creature's chill, so remove only the copy cast by the player.
+        RemoveColdAura(player);
         ClearThirstBlur(player);
         RemoveStateByGuid(player->GetGUID().GetCounter());
     }
@@ -1124,11 +1413,17 @@ namespace HungerThirst
         if (!cfg.Enable || cfg.CurrentMode != Mode::Survival || !cfg.ThirstStates)
             RemoveThirstStates(player);
 
+        // Cold is visible only in survival. It still warms/cools in advisory
+        // (so the gauge and warnings work), but no aura is applied there.
+        if (!cfg.Enable || cfg.CurrentMode != Mode::Survival || !cfg.ExposureEnable)
+            RemoveColdAura(player);
+
         if (!cfg.Enable || cfg.CurrentMode == Mode::Off)
             return;
 
         if (!player->IsInWorld() || !player->IsAlive())
         {
+            RemoveColdAura(player);
             ClearThirstBlur(player);
             return;
         }
@@ -1171,9 +1466,12 @@ namespace HungerThirst
             return;
 
         bool const inDungeon = player->GetMap() && player->GetMap()->IsDungeon();
+        bool const inInstance = IsInstanceMap(player);
         bool const resting = player->HasRestFlag(REST_FLAG_IN_TAVERN) ||
                              player->HasRestFlag(REST_FLAG_IN_CITY) ||
                              player->HasRestFlag(REST_FLAG_IN_FACTION_AREA);
+        bool const sheltered = !player->IsOutdoors() || resting;
+        bool const wet = player->IsInWater();
 
         double multiplier = 1.00;
         if (resting)
@@ -1182,9 +1480,61 @@ namespace HungerThirst
             multiplier *= cfg.InstanceMultiplier;
 
         uint32 const guid = player->GetGUID().GetCounter();
+        uint32 const zoneId = player->GetZoneId();
+        bool const coldZone = cfg.ExposureEnable && !inInstance && cfg.ColdZones.count(zoneId) != 0;
+        bool const hotZone = cfg.ExposureEnable && !inInstance && cfg.HotZones.count(zoneId) != 0;
+        bool const drinking = hotZone && !sheltered && IsDrinking(player);
+
+        // The campfire probe is a grid visit; throttle it instead of walking
+        // the grid on every player update. AtFire is cached in the state and
+        // refreshed every ColdFireCheckIntervalMs while outdoors in a cold
+        // zone.
+        bool needFireCheck = false;
+        bool atFire = false;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto const it = g_states.find(guid);
+            if (it == g_states.end() || !it->second.Loaded)
+                return;
+
+            State& state = it->second;
+            if (coldZone && !sheltered)
+            {
+                state.FireCheckTimerMs += effectiveDiff;
+                if (state.FireCheckTimerMs >= ColdFireCheckIntervalMs)
+                {
+                    state.FireCheckTimerMs %= ColdFireCheckIntervalMs;
+                    needFireCheck = true;
+                }
+                atFire = state.AtFire;
+            }
+            else
+            {
+                state.FireCheckTimerMs = 0;
+                state.AtFire = false;
+            }
+        }
+
+        if (needFireCheck && coldZone && !sheltered)
+        {
+            atFire = IsNearWarmFire(player, cfg);
+
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto const it = g_states.find(guid);
+            if (it != g_states.end())
+                it->second.AtFire = atFire;
+        }
+
+        bool const chilling = coldZone && !sheltered && !atFire;
+        bool const hotEffect = hotZone && !sheltered && !drinking;
 
         char const* satietyMessage = nullptr;
         char const* hydrationMessage = nullptr;
+        char const* coldMessage = nullptr;
+        bool coldDrainWarning = false;
+        bool drainDue = false;
+        uint32 drainIntervals = 0;
+        bool applyColdAuraDesired = false;
         HungerState desiredHungerState = HungerState::None;
         ThirstState desiredThirstState = ThirstState::None;
         bool sendAddon = false;
@@ -1200,17 +1550,39 @@ namespace HungerThirst
 
             double const minutes = double(effectiveDiff) / 60000.0;
             double const satietyLoss = std::max(0.00, cfg.SatietyDecayPerMinute * minutes * multiplier);
-            double const hydrationLoss = std::max(0.00, cfg.HydrationDecayPerMinute * minutes * multiplier);
+            double hydrationLoss = std::max(0.00, cfg.HydrationDecayPerMinute * minutes * multiplier);
+            if (hotEffect)
+                hydrationLoss *= cfg.HotHydrationMultiplier;
 
             double const oldSatiety = state.Satiety;
             double const oldHydration = state.Hydration;
+            double const oldCold = state.Cold;
             Band const oldSatietyBand = state.SatietyBand;
             Band const oldHydrationBand = state.HydrationBand;
+            Band const oldColdBand = state.ColdBand;
 
             state.Satiety = ClampGauge(state.Satiety - satietyLoss);
             state.Hydration = ClampGauge(state.Hydration - hydrationLoss);
 
-            if (state.Satiety != oldSatiety || state.Hydration != oldHydration)
+            if (cfg.ExposureEnable)
+            {
+                double const seconds = double(effectiveDiff) / 1000.0;
+                if (chilling)
+                {
+                    double gain = MaxGaugeValue * seconds / double(cfg.ColdSeconds);
+                    if (wet)
+                        gain *= 2.00;
+                    state.Cold = ClampGauge(state.Cold + gain);
+                }
+                else
+                    state.Cold = ClampGauge(state.Cold - MaxGaugeValue * seconds / double(cfg.WarmSeconds));
+
+                state.ColdBand = ResolveColdBand(state.Cold, state.ColdBand, cfg);
+            }
+
+            state.HotActive = hotEffect;
+
+            if (state.Satiety != oldSatiety || state.Hydration != oldHydration || state.Cold != oldCold)
                 state.Dirty = true;
 
             state.SatietyBand = ResolveBand(state.Satiety, state.SatietyBand, cfg);
@@ -1225,6 +1597,43 @@ namespace HungerThirst
                 satietyMessage = BandMessage(false, state.SatietyBand);
             if (state.HydrationBand > oldHydrationBand && cfg.CurrentMode == Mode::Advisory)
                 hydrationMessage = BandMessage(true, state.HydrationBand);
+
+            // Cold warnings are independent of the hunger/thirst state
+            // messages and are sent in both advisory and survival.
+            if (state.ColdBand > oldColdBand)
+                coldMessage = ColdBandMessage(state.ColdBand);
+
+            if (cfg.CurrentMode == Mode::Survival && cfg.ExposureEnable && !inInstance)
+            {
+                applyColdAuraDesired = state.Cold >= ColdAuraThreshold;
+
+                if (state.Cold >= ColdDrainThreshold && chilling && cfg.ColdHealthDrainPct > 0.00)
+                {
+                    state.ColdDrainTimerMs += effectiveDiff;
+                    drainIntervals = state.ColdDrainTimerMs / cfg.ColdDrainIntervalMs;
+                    if (drainIntervals > 0)
+                    {
+                        state.ColdDrainTimerMs %= cfg.ColdDrainIntervalMs;
+                        drainDue = true;
+                        if (!state.ColdDrainNotified)
+                        {
+                            state.ColdDrainNotified = true;
+                            coldDrainWarning = true;
+                        }
+                    }
+                }
+                else
+                {
+                    state.ColdDrainTimerMs = 0;
+                    if (state.Cold < ColdDrainThreshold)
+                        state.ColdDrainNotified = false;
+                }
+            }
+            else
+            {
+                state.ColdDrainTimerMs = 0;
+                state.ColdDrainNotified = false;
+            }
 
             if (cfg.AddonEnable && cfg.AddonUpdateIntervalMs > 0)
             {
@@ -1245,6 +1654,14 @@ namespace HungerThirst
         if (hydrationMessage)
             SendChatLine(player, hydrationMessage);
 
+        if (coldMessage)
+            SendChatLine(player, coldMessage);
+
+        if (coldDrainWarning)
+            SendChatLine(player,
+                "You are freezing: the cold is draining your health. "
+                "Seek shelter or a fire immediately.");
+
         // Only reconcile while the states are actually active: otherwise the
         // aura would be re-applied right after the entry guard removed it.
         if (cfg.CurrentMode == Mode::Survival && cfg.HungerStates)
@@ -1257,6 +1674,14 @@ namespace HungerThirst
             ApplyThirstState(player, desiredThirstState, cfg);
             UpdateThirstBlur(player, desiredThirstState, cfg, effectiveDiff);
         }
+
+        if (cfg.CurrentMode == Mode::Survival && cfg.ExposureEnable && !inInstance)
+            ApplyColdAura(player, applyColdAuraDesired);
+        else if (!cfg.ExposureEnable || inInstance)
+            RemoveColdAura(player);
+
+        if (drainDue && cfg.CurrentMode == Mode::Survival && cfg.ExposureEnable)
+            ApplyColdHealthDrain(player, drainIntervals, cfg.ColdHealthDrainPct);
 
         if (sendAddon)
             SendAddonState(player);
@@ -1386,15 +1811,18 @@ namespace HungerThirst
         State const& state = it->second;
         out.Satiety = state.Satiety;
         out.Hydration = state.Hydration;
+        out.Cold = state.Cold;
         out.CurrentMode = cfg.CurrentMode;
         out.Loaded = state.Loaded;
         out.PersistenceReady = IsPersistenceReady();
+        out.Hot = state.HotActive;
         out.SatietyBand = state.SatietyBand;
         out.HydrationBand = state.HydrationBand;
+        out.ColdBand = state.ColdBand;
         return true;
     }
 
-    void SetState(Player* player, double satiety, double hydration)
+    void SetState(Player* player, double satiety, double hydration, double cold)
     {
         if (!player)
             return;
@@ -1406,26 +1834,37 @@ namespace HungerThirst
         uint32 const guid = player->GetGUID().GetCounter();
         double const newSatiety = ClampGauge(satiety);
         double const newHydration = ClampGauge(hydration);
+        double const newCold = ClampGauge(cold);
         Band satietyBand = Band::Normal;
         Band hydrationBand = Band::Normal;
+        Band coldBand = Band::Normal;
 
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             State& state = g_states[guid];
             state.Satiety = newSatiety;
             state.Hydration = newHydration;
+            state.Cold = newCold;
             state.Loaded = true;
             state.Dirty = true;
             state.SatietyBand = RawBand(newSatiety, cfg);
             state.HydrationBand = RawBand(newHydration, cfg);
+            state.ColdBand = RawColdBand(newCold);
+            state.ColdDrainTimerMs = 0;
+            state.FireCheckTimerMs = 0;
+            state.AtFire = false;
+            state.ColdDrainNotified = false;
+            state.HotActive = false;
             satietyBand = state.SatietyBand;
             hydrationBand = state.HydrationBand;
+            coldBand = state.ColdBand;
         }
 
         // A GM jump can land directly inside a warning band without Tick
         // observing the crossing, so emit the corresponding warning once.
-        // Band warnings are advisory-only: in survival the state message of
-        // the next Tick informs the player.
+        // Hunger/thirst band warnings are advisory-only: in survival the
+        // state message of the next Tick informs the player. Cold has no
+        // state entry message, so its warning is sent in both modes.
         if (cfg.CurrentMode == Mode::Advisory)
         {
             if (satietyBand >= Band::Warning)
@@ -1441,8 +1880,32 @@ namespace HungerThirst
             }
         }
 
+        if (cfg.ExposureEnable && cfg.CurrentMode != Mode::Off && coldBand >= Band::Warning)
+        {
+            if (char const* message = ColdBandMessage(coldBand))
+                SendChatLine(player, message);
+        }
+
         // Drop any running pulse: the next Tick restarts from the new state.
         ClearThirstBlur(player);
+    }
+
+    void SetState(Player* player, double satiety, double hydration)
+    {
+        if (!player)
+            return;
+
+        Config const& cfg = GetConfig();
+        double cold = cfg.StartingCold;
+
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto const it = g_states.find(player->GetGUID().GetCounter());
+            if (it != g_states.end())
+                cold = it->second.Cold;
+        }
+
+        SetState(player, satiety, hydration, cold);
     }
 
     void ResetState(Player* player)
@@ -1461,15 +1924,24 @@ namespace HungerThirst
             State& state = g_states[guid];
             state.Satiety = ClampGauge(cfg.StartingSatiety);
             state.Hydration = ClampGauge(cfg.StartingHydration);
+            state.Cold = ClampGauge(cfg.StartingCold);
             state.Loaded = true;
             state.Dirty = true;
             state.AddonTimerMs = 0;
             state.SatietyBand = RawBand(state.Satiety, cfg);
             state.HydrationBand = RawBand(state.Hydration, cfg);
+            state.ColdBand = RawColdBand(state.Cold);
+            state.ColdDrainTimerMs = 0;
+            state.FireCheckTimerMs = 0;
+            state.AtFire = false;
+            state.ColdDrainNotified = false;
+            state.HotActive = false;
         }
 
         // Reset restores the gauges only; any running blur is rolled back so
-        // the next Tick starts from the new state.
+        // the next Tick starts from the new state. The cold aura is removed
+        // immediately; the next Tick re-applies it if the gauge calls for it.
+        RemoveColdAura(player);
         ClearThirstBlur(player);
     }
 
@@ -1487,7 +1959,7 @@ namespace HungerThirst
             // Master switch off: send a synthetic disabled state so the client
             // leaves "Loading..." (loaded=1, mode=0, persistence=0).
             std::string const payload = Acore::StringFormat(
-                "{}\t0.0\t0.0\t0\t0\t1\t0\t0\t0", cfg.AddonPrefix);
+                "{}\t0.0\t0.0\t0\t0\t1\t0\t0\t0\t0.0\t0\t0", cfg.AddonPrefix);
 
             WorldPacket data;
             ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON, player, player, payload);
@@ -1503,8 +1975,11 @@ namespace HungerThirst
         // client leaves "Loading..." and shows the placeholder gauges;
         // loaded and persistence both report 0 in that case. The lethal field
         // is kept for addon compatibility but is always 0 now.
+        // The first eight payload fields keep their historical positions and
+        // meanings. cold, coldBand and hot are appended so an older addon
+        // (which ignores extra fields) keeps working.
         std::string const payload = Acore::StringFormat(
-            "{}\t{:.1f}\t{:.1f}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{:.1f}\t{:.1f}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1f}\t{}\t{}",
             cfg.AddonPrefix,
             snapshot.Satiety,
             snapshot.Hydration,
@@ -1513,7 +1988,10 @@ namespace HungerThirst
             snapshot.Loaded ? 1 : 0,
             (snapshot.Loaded && snapshot.PersistenceReady) ? 1 : 0,
             uint32(snapshot.SatietyBand),
-            uint32(snapshot.HydrationBand));
+            uint32(snapshot.HydrationBand),
+            snapshot.Cold,
+            uint32(snapshot.ColdBand),
+            snapshot.Hot ? 1 : 0);
 
         WorldPacket data;
         ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON, player, player, payload);
@@ -1550,6 +2028,19 @@ namespace HungerThirst
             ModeName(snapshot.CurrentMode),
             snapshot.Satiety, BandName(snapshot.SatietyBand, false),
             snapshot.Hydration, BandName(snapshot.HydrationBand, true));
+        handler.PSendSysMessage(
+            "|cffffcc00[Hunger & Thirst]|r Cold: {:.1f}/100 ({}).{}",
+            snapshot.Cold, ColdBandName(snapshot.ColdBand),
+            snapshot.Hot ? " Hot zone: hydration drains faster." : "");
+
+        // Cold has no state message, so restate its warning at login: the
+        // player may reconnect already cold and otherwise get no guidance
+        // until the band changes.
+        if (cfg.ExposureEnable && snapshot.ColdBand >= Band::Warning)
+        {
+            if (char const* message = ColdBandMessage(snapshot.ColdBand))
+                SendChatLine(player, message);
+        }
 
         // In survival the state messages of the next Tick inform the player.
         if (cfg.CurrentMode == Mode::Advisory)
@@ -1618,12 +2109,18 @@ namespace HungerThirst
             snapshot.Satiety, BandName(snapshot.SatietyBand, false),
             snapshot.Hydration, BandName(snapshot.HydrationBand, true));
 
+        handler->PSendSysMessage(
+            "Cold {:.1f}/100 ({}).{}",
+            snapshot.Cold, ColdBandName(snapshot.ColdBand),
+            snapshot.Hot ? " Hot zone: hydration drains faster." : "");
+
         if (cfg.CurrentMode == Mode::Off)
             handler->SendSysMessage("Mode off: gauges are not simulated.");
         else if (cfg.CurrentMode == Mode::Advisory)
             handler->SendSysMessage("Advisory: warnings only, no states, no damage.");
         else
-            handler->SendSysMessage("Survival: hunger and thirst states, no exhaustion damage.");
+            handler->SendSysMessage(
+                "Survival: hunger/thirst states and cold exposure; cold drains health to a 1 % floor.");
     }
 
     char const* ModeName(Mode mode)
@@ -1653,6 +2150,23 @@ namespace HungerThirst
                 return hydration ? "Very thirsty" : "Very hungry";
             case Band::Empty:
                 return hydration ? "Dehydrated" : "Starving";
+        }
+
+        return "unknown";
+    }
+
+    char const* ColdBandName(Band band)
+    {
+        switch (band)
+        {
+            case Band::Normal:
+                return "Comfortable";
+            case Band::Warning:
+                return "Chilly";
+            case Band::Critical:
+                return "Cold";
+            case Band::Empty:
+                return "Freezing";
         }
 
         return "unknown";

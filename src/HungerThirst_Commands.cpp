@@ -4,7 +4,7 @@
  * Exposes the `.hungerthirst` command:
  *   .hungerthirst / .hungerthirst status       show the player's current state
  *   .hungerthirst help                         short help
- *   .hungerthirst set <player> <satiety> <hydration>  game master only
+ *   .hungerthirst set <player> <satiety> <hydration> [cold]  game master only
  *   .hungerthirst reset <player>               game master only
  *
  * The command owns no state: every read and write goes through the
@@ -73,11 +73,11 @@ namespace
         Config const& config = GetConfig();
 
         handler->PSendSysMessage("Hunger & Thirst - commands:");
-        handler->PSendSysMessage("  .hungerthirst, .hungerthirst status: show your satiety and hydration.");
+        handler->PSendSysMessage("  .hungerthirst, .hungerthirst status: show satiety, hydration and cold.");
         handler->PSendSysMessage("  .hungerthirst help: show this help.");
         handler->PSendSysMessage(
-            "  .hungerthirst set <player> <satiety> <hydration>: set the values, "
-            "clamped from 0 to 100 (game master).");
+            "  .hungerthirst set <player> <satiety> <hydration> [cold]: set the values, "
+            "clamped from 0 to 100 (game master). Omit cold to keep the current cold gauge.");
         handler->PSendSysMessage("  .hungerthirst reset <player>: reset a player's state (game master).");
         handler->PSendSysMessage("Thresholds: warning at {} %, critical at {} %. Active mode: {}.",
             config.WarningThreshold, config.CriticalThreshold, ModeName(config.CurrentMode));
@@ -92,9 +92,9 @@ namespace
         if (!EnsureModuleEnabled(handler))
             return false;
 
-        if (tokens.size() != 4)
+        if (tokens.size() != 4 && tokens.size() != 5)
         {
-            handler->PSendSysMessage("Syntax: .hungerthirst set <player> <satiety> <hydration>");
+            handler->PSendSysMessage("Syntax: .hungerthirst set <player> <satiety> <hydration> [cold]");
             handler->SetSentErrorMessage(true);
             return false;
         }
@@ -115,13 +115,35 @@ namespace
         double const clampedSatiety = std::clamp(*satiety, 0.0, 100.0);
         double const clampedHydration = std::clamp(*hydration, 0.0, 100.0);
 
-        SetState(target, clampedSatiety, clampedHydration);
+        double clampedCold = 0.0;
+        if (tokens.size() == 5)
+        {
+            Optional<double> cold = Acore::StringTo<double>(tokens[4]);
+            if (!cold || !std::isfinite(*cold))
+            {
+                handler->PSendSysMessage("The cold value must be a number.");
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+
+            clampedCold = std::clamp(*cold, 0.0, 100.0);
+            SetState(target, clampedSatiety, clampedHydration, clampedCold);
+        }
+        else
+            SetState(target, clampedSatiety, clampedHydration);
+
         SaveState(target, true);
         SendAddonState(target);
 
         char const* persistenceNote = IsPersistenceReady() ? "" : " (not persisted: database unavailable)";
-        handler->PSendSysMessage("State of {} set: satiety {:.1f}/100, hydration {:.1f}/100{}.",
-            target->GetName(), clampedSatiety, clampedHydration, persistenceNote);
+        if (tokens.size() == 5)
+            handler->PSendSysMessage(
+                "State of {} set: satiety {:.1f}/100, hydration {:.1f}/100, cold {:.1f}/100{}.",
+                target->GetName(), clampedSatiety, clampedHydration, clampedCold, persistenceNote);
+        else
+            handler->PSendSysMessage(
+                "State of {} set: satiety {:.1f}/100, hydration {:.1f}/100, cold unchanged{}.",
+                target->GetName(), clampedSatiety, clampedHydration, persistenceNote);
         return true;
     }
 
@@ -149,7 +171,7 @@ namespace
         SendAddonState(target);
 
         char const* persistenceNote = IsPersistenceReady() ? "" : " (not persisted: database unavailable)";
-        handler->PSendSysMessage("Hunger/thirst state of {} reset{}.", target->GetName(), persistenceNote);
+        handler->PSendSysMessage("Hunger/thirst/cold state of {} reset{}.", target->GetName(), persistenceNote);
         return true;
     }
 }

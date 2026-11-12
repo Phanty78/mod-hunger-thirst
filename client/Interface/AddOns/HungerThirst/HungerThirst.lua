@@ -1,17 +1,28 @@
 --[[--------------------------------------------------------------------------
-    Hunger & Thirst - hunger and thirst gauges (client 3.3.5a, Interface 30300).
+    Hunger & Thirst - hunger, thirst and cold gauges (client 3.3.5a, Interface 30300).
 
     Server protocol, addon prefix "HT":
         HT<TAB>satiety<TAB>hydration<TAB>mode<TAB>lethal<TAB>loaded
           <TAB>persistence<TAB>satBand<TAB>hydBand
+          <TAB>cold<TAB>coldBand<TAB>hot
+
+    The eleven fields are, in order: 1 satiety, 2 hydration, 3 mode, 4 lethal,
+    5 loaded, 6 persistence, 7 satBand, 8 hydBand, 9 cold, 10 coldBand, 11 hot.
+
+    Fields 9-11 are optional and were appended to the original eight-field
+    protocol: older addons ignore them, and a message that only carries eight
+    fields leaves cold at 0 (comfortable) and hot at false.
 
     mode: 0 = disabled, 1 = advisory, 2 = survival
     band: 0 = normal, 1 = warning, 2 = critical, 3 = empty
+    cold band: 0 = Comfortable, 1 = Chilly, 2 = Cold, 3 = Freezing
+    cold: 0 = comfortable, 100 = freezing
+    hot: 0 = temperate or cold zone, 1 = hot zone (hydration drains faster)
 
     The prefix is sent separately through CHAT_MSG_ADDON; the leading "HT"
     token in the message body is accepted and then ignored.
 
-    A bar of two status icons stays visible at all times, even when the main
+    A bar of three status icons stays visible at all times, even when the main
     frame is hidden; "/hungerthirst icons" shows or hides it.
 ----------------------------------------------------------------------------]]
 
@@ -33,15 +44,17 @@ local BAND_COLORS = {
     [3] = { 1.00, 0.20, 0.20 },
 }
 
--- Identity colors of the two gauges, used while the band is normal.
+-- Identity colors of the three gauges, used while the band is normal.
 local BAR_COLORS = {
     satiety   = { 1.00, 0.62, 0.12 },
     hydration = { 0.20, 0.58, 1.00 },
+    cold      = { 0.55, 0.85, 1.00 },
 }
 
 local BAND_LABELS = {
     satiety   = { [0] = "Satiated", [1] = "Hungry", [2] = "Very hungry", [3] = "Starving" },
     hydration = { [0] = "Hydrated", [1] = "Thirsty", [2] = "Very thirsty", [3] = "Dehydrated" },
+    cold      = { [0] = "Comfortable", [1] = "Chilly", [2] = "Cold", [3] = "Freezing" },
 }
 
 local State = {
@@ -53,6 +66,9 @@ local State = {
     persistence = false,
     satietyBand = 0,
     hydrationBand = 0,
+    cold = 0,
+    coldBand = 0,
+    hot = false,
 }
 
 if type(HungerThirstDB) ~= "table" then
@@ -104,7 +120,7 @@ end
 
 local Frame = CreateFrame("Frame", "HungerThirstFrame", UIParent)
 Frame:SetWidth(240)
-Frame:SetHeight(142)
+Frame:SetHeight(192)
 Frame:SetFrameStrata("MEDIUM")
 Frame:SetClampedToScreen(true)
 Frame:SetMovable(true)
@@ -169,9 +185,15 @@ HydrationGauge.value:SetPoint("TOPRIGHT", SatietyGauge.bar, "BOTTOMRIGHT", 0, -1
 HydrationGauge.bar:SetPoint("TOPLEFT", HydrationGauge.label, "BOTTOMLEFT", 0, -3)
 HydrationGauge.bar:SetPoint("TOPRIGHT", HydrationGauge.value, "BOTTOMRIGHT", 0, -3)
 
+local ColdGauge = CreateGauge(Frame, "Cold", "cold")
+ColdGauge.label:SetPoint("TOPLEFT", HydrationGauge.bar, "BOTTOMLEFT", 0, -10)
+ColdGauge.value:SetPoint("TOPRIGHT", HydrationGauge.bar, "BOTTOMRIGHT", 0, -10)
+ColdGauge.bar:SetPoint("TOPLEFT", ColdGauge.label, "BOTTOMLEFT", 0, -3)
+ColdGauge.bar:SetPoint("TOPRIGHT", ColdGauge.value, "BOTTOMRIGHT", 0, -3)
+
 local Status = Frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-Status:SetPoint("TOPLEFT", HydrationGauge.bar, "BOTTOMLEFT", 0, -10)
-Status:SetPoint("TOPRIGHT", HydrationGauge.bar, "BOTTOMRIGHT", 0, -10)
+Status:SetPoint("TOPLEFT", ColdGauge.bar, "BOTTOMLEFT", 0, -10)
+Status:SetPoint("TOPRIGHT", ColdGauge.bar, "BOTTOMRIGHT", 0, -10)
 Status:SetHeight(30)
 Status:SetJustifyH("LEFT")
 Status:SetJustifyV("TOP")
@@ -221,6 +243,9 @@ local function UpdateStatus()
     if State.lethal then
         text = text .. " · |cffff4040Lethal|r"
     end
+    if State.hot then
+        text = text .. " · |cffff6060Hot|r"
+    end
     if not State.persistence then
         text = text .. " · |cffff9d00Not persisted|r"
     end
@@ -232,6 +257,7 @@ local UpdateIcons
 local function Update()
     UpdateGauge(SatietyGauge, State.satiety, State.satietyBand)
     UpdateGauge(HydrationGauge, State.hydration, State.hydrationBand)
+    UpdateGauge(ColdGauge, State.cold, State.coldBand)
     UpdateStatus()
     UpdateIcons()
 end
@@ -289,7 +315,7 @@ end)
 --------------------------------------------------------------------------------
 -- Status icon bar (permanent)
 --
--- Two icons stay visible even when the main frame is hidden.
+-- Three icons stay visible even when the main frame is hidden.
 -- Choice: the bar is movable (drag an icon); its position is saved and
 -- "/hungerthirst reset" also brings it back to the bottom right.
 --------------------------------------------------------------------------------
@@ -302,10 +328,11 @@ local ICON_DEFAULT_POSITION = { point = "BOTTOMRIGHT", relativePoint = "BOTTOMRI
 local ICON_TEXTURES = {
     satiety   = "Interface\\Icons\\INV_Misc_Food_15",
     hydration = "Interface\\Icons\\INV_Drink_05",
+    cold      = "Interface\\Icons\\Spell_Frost_ChillingArmor",
 }
 
 local IconsBar = CreateFrame("Frame", nil, UIParent)
-IconsBar:SetWidth(ICON_SIZE * 2 + ICON_SPACING)
+IconsBar:SetWidth(ICON_SIZE * 3 + ICON_SPACING * 2)
 IconsBar:SetHeight(ICON_SIZE)
 IconsBar:SetFrameStrata("MEDIUM")
 IconsBar:SetClampedToScreen(true)
@@ -350,6 +377,9 @@ SatietyIcon:SetPoint("LEFT", IconsBar, "LEFT", 0, 0)
 local HydrationIcon = CreateStatusIcon(IconsBar, "hydration", "Hydration")
 HydrationIcon:SetPoint("LEFT", SatietyIcon, "RIGHT", ICON_SPACING, 0)
 
+local ColdIcon = CreateStatusIcon(IconsBar, "cold", "Cold")
+ColdIcon:SetPoint("LEFT", HydrationIcon, "RIGHT", ICON_SPACING, 0)
+
 local function UpdateIcon(icon)
     local band = State[icon.key .. "Band"] or 0
     local alpha = 0.55
@@ -379,6 +409,7 @@ end
 UpdateIcons = function()
     UpdateIcon(SatietyIcon)
     UpdateIcon(HydrationIcon)
+    UpdateIcon(ColdIcon)
 end
 
 local function ToggleFrame()
@@ -522,7 +553,7 @@ local function OnIconDragStop()
     HandleIconClick()
 end
 
-for _, icon in ipairs({ SatietyIcon, HydrationIcon }) do
+for _, icon in ipairs({ SatietyIcon, HydrationIcon, ColdIcon }) do
     icon:SetScript("OnMouseDown", OnIconMouseDown)
     icon:SetScript("OnMouseUp", OnIconMouseUp)
     icon:SetScript("OnDragStart", OnIconDragStart)
@@ -564,6 +595,12 @@ local function ParsePayload(text)
         return nil
     end
 
+    -- Fields 9-11 are appended to the original eight-field protocol, so they
+    -- are optional: an old server leaves cold at 0 and hot at false.
+    local cold = tonumber(fields[9]) or 0
+    local coldBand = NormalizeBand(fields[10])
+    local hot = (tonumber(fields[11]) or 0) ~= 0
+
     return {
         satiety = Clamp(satiety),
         hydration = Clamp(hydration),
@@ -573,6 +610,9 @@ local function ParsePayload(text)
         persistence = (tonumber(fields[6]) or 0) ~= 0,
         satietyBand = NormalizeBand(fields[7]),
         hydrationBand = NormalizeBand(fields[8]),
+        cold = Clamp(cold),
+        coldBand = coldBand,
+        hot = hot,
     }
 end
 
@@ -585,6 +625,9 @@ local function ApplyPayload(payload)
     State.persistence = payload.persistence
     State.satietyBand = payload.satietyBand
     State.hydrationBand = payload.hydrationBand
+    State.cold = payload.cold
+    State.coldBand = payload.coldBand
+    State.hot = payload.hot
     Update()
 end
 

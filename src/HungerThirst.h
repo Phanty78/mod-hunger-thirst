@@ -11,6 +11,7 @@
 
 #include "Define.h"
 #include <string>
+#include <unordered_set>
 
 class Aura;
 class ChatHandler;
@@ -61,7 +62,20 @@ struct Config
     uint32 AuraCreditCooldownMs    = 30000;
     double StartingSatiety         = 100.00;
     double StartingHydration       = 100.00;
+    double StartingCold            = 0.00;
     double Hysteresis              = 2.00;
+
+    // Cold and heat exposure. Cold is a third gauge (0 = comfortable,
+    // 100 = freezing); heat has no gauge and only multiplies hydration loss.
+    bool   ExposureEnable              = true;
+    std::unordered_set<uint32> ColdZones;
+    std::unordered_set<uint32> HotZones;
+    std::unordered_set<uint32> ColdFires;
+    uint32 ColdSeconds                 = 600;
+    uint32 WarmSeconds                 = 120;
+    uint32 ColdDrainIntervalMs         = 5000;
+    double ColdHealthDrainPct          = 1.00;
+    double HotHydrationMultiplier      = 2.00;
     bool   ShowLoginSummary        = true;
     bool   DebugLog                = false;
     bool   AddonEnable             = true;
@@ -73,11 +87,14 @@ struct Snapshot
 {
     double Satiety           = 100.00;
     double Hydration         = 100.00;
+    double Cold              = 0.00;
     Mode   CurrentMode       = Mode::Off;
     bool   Loaded            = false;
     bool   PersistenceReady  = false;
+    bool   Hot               = false;
     Band   SatietyBand       = Band::Normal;
     Band   HydrationBand     = Band::Normal;
+    Band   ColdBand          = Band::Normal;
 };
 
 Config& GetConfig();
@@ -96,6 +113,7 @@ void CreditConsumable(Player* player, Aura* aura);
 
 bool GetSnapshot(Player* player, Snapshot& out);
 void SetState(Player* player, double satiety, double hydration);
+void SetState(Player* player, double satiety, double hydration, double cold);
 void ResetState(Player* player);
 
 void SendAddonState(Player* player);
@@ -104,6 +122,7 @@ void SendStatus(ChatHandler* handler, Player* player);
 
 char const* ModeName(Mode mode);
 char const* BandName(Band band, bool hydration);
+char const* ColdBandName(Band band);
 
 void AddHungerThirstPlayerScripts();
 void AddHungerThirstCommandScript();

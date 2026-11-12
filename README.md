@@ -9,15 +9,17 @@
 
 ## Description
 
-Hunger & Thirst is a standalone [AzerothCore](https://www.azerothcore.org/) module for World of Warcraft: Wrath of the Lich King 3.3.5a. It gives every character a satiety gauge and a hydration gauge, both running from 0 to 100. The gauges fall over time and are restored by eating and drinking. In `survival` mode, low satiety shows a visible hunger state and low hydration a visible thirst state, two debuffs that weaken the character. Neither gauge ever removes health or kills the character.
+Hunger & Thirst is a standalone [AzerothCore](https://www.azerothcore.org/) module for World of Warcraft: Wrath of the Lich King 3.3.5a. It gives every character a satiety gauge and a hydration gauge, both running from 0 to 100. The gauges fall over time and are restored by eating and drinking. In `survival` mode, low satiety shows a visible hunger state and low hydration a visible thirst state, two debuffs that weaken the character. Neither gauge removes health or kills the character.
 
-No client patch is required: the states reuse four standard Blizzard spells, including their icons, as server-side auras, and the server cannot rewrite their client tooltips. A graphical addon is included but **optional**: it also replaces the four state-aura tooltips with the real effects and the remedy, while without it the original Blizzard tooltips remain and chat warnings, the login summary and the `.hungerthirst` command stay available.
+An optional cold and heat exposure layer adds a third gauge: cold rises from 0 (comfortable) to 100 (freezing) while the character is outdoors in a cold zone, away from a fire, and falls back under shelter. In `survival` mode it also shows the stock `Chilled` aura and, at 100, drains health down to a 1% floor, so even cold exposure cannot kill a character on its own. Hot zones have no gauge: they only make hydration drain faster.
+
+No client patch is required: the states reuse four standard Blizzard spells, including their icons, as server-side auras, and the server cannot rewrite their client tooltips. The cold state reuses the stock `Chilled` spell (6136) unchanged, applied and refreshed by the server. A graphical addon is included but **optional**: it also replaces the four state-aura tooltips with the real effects and the remedy, while without it the original Blizzard tooltips remain and chat warnings, the login summary and the `.hungerthirst` command stay available.
 
 This repository is a module repository, not a fork of the core. It is not bundled with AzerothCore and must be installed into the `modules/` directory of an existing WotLK 3.3.5a source tree.
 
 ## Features
 
-- Per-character satiety and hydration gauges persisted in the characters database.
+- Per-character satiety, hydration and cold gauges persisted in the characters database.
 - Decay based on active play time, with separate rest-area and dungeon/raid multipliers.
 - Configurable pauses for taxi flights, battlegrounds, arenas, duels and game masters.
 - Warning and critical thresholds with hysteresis, chat warnings, an optional login summary and state entry thresholds at the warning band.
@@ -25,10 +27,13 @@ This repository is a module repository, not a fork of the core. It is not bundle
 - Two visible hunger states in `survival` mode, built on two otherwise unused Blizzard spells: a weakened state at or below the warning threshold (movement speed and damage dealt reduced, damage taken increased) and a stronger starving state at 0.
 - Two visible thirst states in `survival` mode, built on two otherwise unused Blizzard spells: a thirsty state at or below the warning threshold that reduces mana regeneration, magical damage done and healing done by 10% by default, and a dehydrated state at 0 that applies the same three penalties at 30% by default.
 - A periodic drinking blur for the thirst states: a 2-second client blur every 10 seconds at intensity 35 (thirsty) or 45 (dehydrated), applied through a player update field. Both intensities stay below the client's drunk threshold (50), so the effect only tints the screen and never switches the character into the drunk stance or its walk animation; there is no aura and no gameplay effect. The blur is not what caused the sliding walk reported on a real client: the old dehydrated spell 14870 (now retired) has a stun in the stock client data, so the client played the stunned stand animation while the server let the character move. The dehydrated spell is now 5909, which keeps the same icon with a stat aura on the client.
-- Thirst applies penalties only: hydration never removes health, never kills and never logs a death.
+- Hunger and thirst apply penalties only: neither gauge removes health, kills or logs a death.
+- Cold and heat exposure (optional, `ExposureEnable`): a cold gauge from 0 (comfortable) to 100 (freezing) that rises outdoors in configured cold zones and falls under shelter or near a campfire, with `Chilly`, `Cold` and `Freezing` bands and chat warnings in both `advisory` and `survival`.
+- In `survival` mode, cold at or above 75 keeps the stock `Chilled` aura (6136) on the player with a 15-second duration refreshed on every tick, and cold at 100 drains `ColdHealthDrainPct` of maximum health per `ColdDrainIntervalMs` down to a floor of 1% of maximum health. That drain cannot kill a character on its own, and it never runs in `advisory`, in instances or with `ExposureEnable=0`.
+- Hot zones have no gauge: while the character is outdoors in a configured hot zone, is not sheltered and is not drinking, hydration loss is multiplied by `HotHydrationMultiplier`.
 - Food and drink credit from items, feasts, game objects and player-cast auras, with anti-double-credit windows.
 - Optional client addon using the `HT` addon prefix and the built-in 3.3.5a textures only.
-- No SQL file to import: the characters table is created automatically at startup.
+- No SQL file to import: the characters table is created automatically at startup, and an existing table is upgraded with `ALTER TABLE` to add the `cold` column.
 
 ## Requirements
 
@@ -105,6 +110,16 @@ Another exception: `HungerThirst.HungerStatePenaltyPct`, `HungerThirst.HungerSta
 | `HungerThirst.ThirstDehydratedPenaltyPct` | `30.00` | Penalty of the dehydrated state, in percent, applied to the same three effects. Clamped to 0-90. Baked into the spell aura at startup, so changing it requires a restart. |
 | `HungerThirst.ThirstBlurIntervalMs` | `10000` | Interval between two drinking blur pulses while a thirst state is active, in milliseconds. Values below 1000 are clamped to 1000. Reloadable. |
 | `HungerThirst.ThirstBlurDurationMs` | `2000` | Duration of one drinking blur pulse, in milliseconds. Values below 100 are clamped to 100. Reloadable. |
+| `HungerThirst.ExposureEnable` | `1` | Master switch for cold and heat exposure. With `0` the cold gauge is frozen at its current value (no gain, no warming), the `Chilled` aura is removed at the next tick, the health drain stops and hot zones have no effect; the gauge is still persisted and reported. Reloadable. |
+| `HungerThirst.StartingCold` | `0.00` | Cold assigned to a character with no stored row, and the value restored by `.hungerthirst reset`. Clamped to 0-100. |
+| `HungerThirst.ColdZones` | `1,65,67,210,618` | Comma-separated zone IDs where the cold gauge rises while the player is exposed. An empty value disables cold gain. See [Cold and heat](#cold-and-heat). |
+| `HungerThirst.HotZones` | `3,46,51,440,3483` | Comma-separated zone IDs counted as hot. Heat has no gauge: hydration loss is multiplied by `HotHydrationMultiplier` when the player is outdoors, not sheltered and not drinking. |
+| `HungerThirst.ColdCampfireEntries` | `2061` | Extra `gameobject_template` entries treated as a warm fire, in addition to every `SPELL_FOCUS` game object with focus id 4. Entry 2061 (`Campfire`) is listed explicitly so the stock campfire works even though its `spellFocus.focusId` is `0`. |
+| `HungerThirst.ColdSeconds` | `600` | Seconds needed to go from 0 to 100 cold while exposed; swimming doubles the rate. Values below 30 are clamped to 30. |
+| `HungerThirst.WarmSeconds` | `120` | Seconds needed to go from 100 back to 0 cold while warm or sheltered, that is whenever the player is not exposed. Values below 30 are clamped to 30. |
+| `HungerThirst.ColdDrainIntervalMs` | `5000` | `survival` only. Interval between two cold health drain ticks at 100 cold while the player is still exposed. Values below 1000 are clamped to 1000. |
+| `HungerThirst.ColdHealthDrainPct` | `1.00` | `survival` only. Percent of maximum health removed per drain interval at 100 cold, with a floor of 1% of maximum health, so it cannot kill alone. `0` disables the drain while keeping the aura and the warnings. Clamped to 0-100. |
+| `HungerThirst.HotHydrationMultiplier` | `2.00` | Hydration loss multiplier in a hot zone when the player is outdoors, not sheltered and not drinking. Clamped to 1-10; `1` disables the effect. |
 | `HungerThirst.FoodSatietyGain` | `30.00` | Satiety restored when a food aura is credited (`SPELL_SPECIFIC_FOOD` or `FOOD_AND_DRINK`). The gain is clamped to 0-100 and the gauge itself to 100. |
 | `HungerThirst.DrinkHydrationGain` | `35.00` | Hydration restored when a drink aura is credited (`SPELL_SPECIFIC_DRINK` or `FOOD_AND_DRINK`). The gain is clamped to 0-100 and the gauge itself to 100. |
 | `HungerThirst.RestoreCooldownMs` | `1000` | Anti-double-credit window for item-based food and drink only: the same cast item entry is credited at most once per window, so refresh callbacks for one bite are ignored. Auras without a cast item use `AuraCreditCooldownMs` instead. Values below 1000 are clamped to 1000. |
@@ -112,7 +127,7 @@ Another exception: `HungerThirst.HungerStatePenaltyPct`, `HungerThirst.HungerSta
 | `HungerThirst.StartingSatiety` | `100.00` | Satiety assigned to a character with no stored row (a new character, or the first login after installing the module). Clamped to 0-100. |
 | `HungerThirst.StartingHydration` | `100.00` | Hydration assigned to a character with no stored row. Clamped to 0-100. |
 | `HungerThirst.Hysteresis` | `2.00` | Points a gauge must gain strictly above the threshold it is leaving before its band improves. Bands always worsen immediately. The same margin governs the exit of the hunger and thirst states. `0` disables hysteresis. Clamped to 0-`(100 - WarningThreshold)` so a full gauge can always leave the warning band. |
-| `HungerThirst.ShowLoginSummary` | `1` | Send a one-line chat summary (mode, gauges, bands) on login when the module is enabled and the mode is not `off`. In `survival` mode, the state chat lines replace the corresponding band warnings when the matching states are enabled. |
+| `HungerThirst.ShowLoginSummary` | `1` | Send a two-line chat summary on login when the module is enabled and the mode is not `off`: mode, satiety and hydration with their bands, then the cold value with its band and a note when the player is in a hot zone. The cold band warning is restated at login when exposure is enabled and the gauge is at 25 or more, so a reconnecting player is not left without guidance. In `survival` mode, the state chat lines replace the corresponding band warnings when the matching states are enabled. |
 | `HungerThirst.DebugLog` | `0` | Emit `LOG_DEBUG` lines for state load and save, and consumable credits. |
 | `HungerThirst.AddonEnable` | `1` | Send addon state packets when `Enable=1`, `AddonEnable=1` and the player's state is loaded. A login snapshot is sent even in mode `off` (`mode=0`), and one synthetic disabled snapshot is sent when the module is disabled, so the addon can display `Disabled`. Periodic packets run only while the tick is active (`advisory` or `survival`, not paused). The packet is a `CHAT_MSG_WHISPER` / `LANG_ADDON` message sent directly to the player. |
 | `HungerThirst.AddonUpdateIntervalMs` | `1000` | Periodic addon packet interval in milliseconds while the tick is active. The login snapshot is sent immediately. Values below 1000 are clamped to 1000. |
@@ -122,9 +137,10 @@ Validation performed while loading:
 
 - An unknown `Mode` becomes `off` and logs an error.
 - `CriticalThreshold` must be lower than `WarningThreshold`; otherwise the critical threshold is adjusted and an error is logged. `WarningThreshold` above 100 is clamped to 100.
-- Gauges, percentages, gains and decay rates are clamped to 0-100.
+- Gauges (satiety, hydration, cold), percentages, gains and decay rates are clamped to 0-100.
 - The two hunger penalty percentages and the two thirst penalty percentages are clamped to 0-90 rather than 0-100.
-- `RestMultiplier` and `InstanceMultiplier` are clamped to 0-10.
+- `RestMultiplier` and `InstanceMultiplier` are clamped to 0-10. `HotHydrationMultiplier` is clamped to 1-10.
+- `ColdSeconds` and `WarmSeconds` are clamped to a minimum of 30 seconds.
 - `ThirstBlurIntervalMs` is clamped to a minimum of 1000 ms and `ThirstBlurDurationMs` to a minimum of 100 ms.
 - Other intervals and cooldowns are clamped to a minimum of 1000 ms.
 - `Hysteresis` is clamped to 0-`(100 - WarningThreshold)`.
@@ -135,26 +151,26 @@ The command is available in game only, not from the server console. Subcommands 
 
 | Command | Access | Effect |
 |---|---|---|
-| `.hungerthirst` or `.hungerthirst status` | Player | Show the active mode, state loaded or not loaded, persistence ready or unavailable, both gauges with their bands, and a one-line explanation of the mode. |
+| `.hungerthirst` or `.hungerthirst status` | Player | Show the active mode, state loaded or not loaded, persistence ready or unavailable, the three gauges with their bands (satiety, hydration, cold), whether the player is in a hot zone, and a one-line explanation of the mode. |
 | `.hungerthirst help` | Player | Show the command list, the warning and critical thresholds, and the active mode. |
-| `.hungerthirst set <player> <satiety> <hydration>` | Game master (`SEC_GAMEMASTER`) | Set both gauges, clamped to 0-100, and force a save. The target must be online. The hunger and thirst states are reconciled on the next active tick. |
-| `.hungerthirst reset <player>` | Game master (`SEC_GAMEMASTER`) | Restore the target to `StartingSatiety` and `StartingHydration`, and force a save. The target must be online. Any active state and blur are cleared or reconciled on the next active tick. |
+| `.hungerthirst set <player> <satiety> <hydration> [cold]` | Game master (`SEC_GAMEMASTER`) | Set the gauges, clamped to 0-100, and force a save. `cold` is optional: omitted, the current cold gauge is preserved. The target must be online. The hunger, thirst and cold states are reconciled on the next active tick. |
+| `.hungerthirst reset <player>` | Game master (`SEC_GAMEMASTER`) | Restore the target to `StartingSatiety`, `StartingHydration` and `StartingCold`, and force a save. The target must be online. Any active state, the cold aura and the blur are cleared or reconciled on the next active tick. |
 
 `status` and `help` still answer when the module is disabled. `set` and `reset` fail with a message when the module is disabled, when the caller lacks game master security, or when the named player is offline.
 
 ## Modes
 
-| `HungerThirst.Mode` | Decay | Warnings and login summary | Hunger states | Thirst states | Blur | Periodic addon updates |
-|---|---|---|---|---|---|---|
-| `off` (default) | No | No | No | No | No | No |
-| `advisory` | Yes | Yes | No | No | No | Yes |
-| `survival` | Yes | Band warnings replaced by the state chat lines for the gauges whose states are enabled; the login summary still reports gauges and bands | Yes with `HungerStates=1` | Yes with `ThirstStates=1` | Yes with `ThirstStates=1` | Yes |
+| `HungerThirst.Mode` | Decay | Warnings and login summary | Hunger states | Thirst states | Blur | Cold gauge | Chilled aura and cold drain | Periodic addon updates |
+|---|---|---|---|---|---|---|---|---|
+| `off` (default) | No | No | No | No | No | Frozen at its stored value | No | No |
+| `advisory` | Yes | Yes | No | No | No | Simulated with `ExposureEnable=1`, with cold band warnings | No | Yes |
+| `survival` | Yes | Band warnings replaced by the state chat lines for the gauges whose states are enabled; the login summary still reports gauges and bands; cold band warnings are always sent | Yes with `HungerStates=1` | Yes with `ThirstStates=1` | Yes with `ThirstStates=1` | Simulated, with cold band warnings | Yes with `ExposureEnable=1`, outside instances | Yes |
 
-`off` keeps the module loaded: the state is persisted and can be queried, and the login addon snapshot is still sent with `mode=0`, but nothing is simulated. `Enable=0` is stronger than `Mode=off`: state is not loaded or saved at all and the module reports itself as disabled.
+`off` keeps the module loaded: the state is persisted and can be queried, and the login addon snapshot is still sent with `mode=0`, but nothing is simulated and the cold gauge does not move. `Enable=0` is stronger than `Mode=off`: state is not loaded or saved at all and the module reports itself as disabled.
 
-No mode applies damage. `survival` combines the two visible state families with their chat lines and, for thirst, the blur; neither gauge ever removes health, and the module cannot kill a character in any mode.
+Hunger and thirst never apply damage in any mode. `survival` combines the two visible state families with their chat lines and, for thirst, the blur. Cold exposure, in `survival` mode only, adds the stock `Chilled` aura and the only health drain in the module; that drain stops at a 1% floor and therefore cannot kill a character on its own.
 
-Hunger and thirst states exist only in `survival` mode. In `off` and `advisory`, any active state aura is removed at the next tick, and any active blur is restored. With `HungerStates=0`, hunger has no gameplay effect and its band warnings are not sent in `survival`; with `ThirstStates=0`, hydration has no gameplay effect, no state and no blur, and its band warnings are not sent in `survival`. `advisory` still shows all band warnings and never applies a state or a blur.
+Hunger and thirst states exist only in `survival` mode. In `off` and `advisory`, any active state aura is removed at the next tick, and any active blur is restored. With `HungerStates=0`, hunger has no gameplay effect and its band warnings are not sent in `survival`; with `ThirstStates=0`, hydration has no gameplay effect, no state and no blur, and its band warnings are not sent in `survival`. `advisory` still shows all band warnings and never applies a state or a blur. The cold gauge is the exception: it is simulated in `advisory` as well, and only its `Chilled` aura and health drain are restricted to `survival`.
 
 ### Bands
 
@@ -165,7 +181,7 @@ Hunger and thirst states exist only in `survival` mode. In `off` and `advisory`,
 | Critical | Very hungry | Very thirsty |
 | Empty | Starving | Dehydrated |
 
-A gauge is empty at 0, critical at or below `CriticalThreshold`, in the warning band at or below `WarningThreshold`, and normal above it. Warning messages fire when a band worsens. Hysteresis prevents messages from flapping around a threshold: a band only improves once the gauge is strictly above the threshold it is leaving plus `Hysteresis`. In `survival` mode the satiety band selects the hunger state and the hydration band selects the thirst state; with the corresponding states enabled, the band warnings are replaced by the state chat line. Advisory mode never applies states, so it keeps every band warning.
+A gauge is empty at 0, critical at or below `CriticalThreshold`, in the warning band at or below `WarningThreshold`, and normal above it. Warning messages fire when a band worsens. Hysteresis prevents messages from flapping around a threshold: a band only improves once the gauge is strictly above the threshold it is leaving plus `Hysteresis`. The cold gauge uses its own fixed thresholds and labels; see [Cold and heat](#cold-and-heat). In `survival` mode the satiety band selects the hunger state and the hydration band selects the thirst state; with the corresponding states enabled, the band warnings are replaced by the state chat line. Advisory mode never applies states, so it keeps every band warning.
 
 The status command uses the words `loaded` or `not loaded` for the state and `ready` or `unavailable` for persistence.
 
@@ -210,7 +226,7 @@ The dehydrated state previously reused 14870 ("Drunken Stupor"). It carries the 
   - **Magical damage done**: `SPELL_AURA_MOD_DAMAGE_PERCENT_DONE` (79) limited to `SPELL_SCHOOL_MASK_MAGIC`. Physical, ranged and pet damage are not affected, and neither is damage taken.
   - **Healing done**: `SPELL_AURA_MOD_HEALING_DONE_PERCENT` (136).
 - The aura is a negative debuff (red border) and cannot be dispelled, cancelled by right-click or removed by immunity effects: the patched spells have no dispel type and no mechanic. Only the module removes them, following the band, when the states are disabled or when the mode leaves `survival`.
-- Thirst has no damage component: hydration never removes health and the module never kills. There is no damage-per-hit setting, no lethal switch, no damage ramp, no one-health floor, no death cause and no death log. The only consequences of thirst are the three percentage penalties and the blur.
+- Thirst has no damage component: hydration never removes health. There is no damage-per-hit setting, no lethal switch and no damage ramp for the thirst states; the only health drain in the module is the cold one, which stops at a 1% floor and has no death cause or death log. The only consequences of thirst are the three percentage penalties and the blur.
 - The state is reconciled on every active tick, which covers login, resurrection, `.reload config` and `.hungerthirst set/reset`. Death removes all auras by core behavior; the next active tick after resurrection re-applies the state if the band still calls for it.
 - Any pause (taxi, battleground, arena, duel, GM exemption) stops the tick: gauges are frozen, the state aura is left exactly as it was with no chat line and no update, and any active blur is cleared (restoring the previous client value) for the duration of the pause.
 - The client displays the original Blizzard spell name and icon, localized by the client. Its tooltip keeps the original Blizzard description, which describes unrelated effects, and does not show the configured percentages or the spirit-only mana limitation; the chat line, the configuration and this README are the authoritative source. The optional addon replaces that tooltip with the real effects and the remedy. Without the addon the Blizzard text stays, because no server-side change can alter a client tooltip without a client patch.
@@ -234,7 +250,56 @@ While a thirst state is active, the module pulses a drinking blur on the player 
 - A battleground or arena pauses the module when the corresponding switch is `1`. With both switches at `0`, decay, warnings, states and blur keep updating.
 - GM accounts are skipped when `ExemptGMs=1`.
 
-While paused, decay, warnings, state updates, blur and periodic addon updates stop. The login snapshot is unaffected. An existing state aura stays in place for the duration of the pause, so a paused player keeps the debuff without any further chat line; if the state aura was removed (for example by death) while the pause applies, it is restored by the first active tick once no pause applies. Any active blur is cleared at the start of the pause and is not resumed until the next pulse after the pause ends.
+While paused, decay, warnings, state updates, blur and periodic addon updates stop. The cold gauge is frozen, its aura stays in place and the cold health drain stops. The login snapshot is unaffected. An existing state aura stays in place for the duration of the pause, so a paused player keeps the debuff without any further chat line; if the state aura was removed (for example by death) while the pause applies, it is restored by the first active tick once no pause applies. Any active blur is cleared at the start of the pause and is not resumed until the next pulse after the pause ends.
+
+## Cold and heat
+
+Cold and heat are an optional exposure layer on top of hunger and thirst. The layer is controlled by `HungerThirst.ExposureEnable` (on by default) and adds a third gauge, `Cold`, stored next to the other two and reported by the status command, the login summary and the addon.
+
+### Cold bands
+
+| Cold | Band | Effect |
+|---|---|---|
+| 0-24 | Comfortable | No gameplay effect. |
+| 25-49 | Chilly | Band warning `You are starting to feel cold. Seek shelter or a fire.` |
+| 50-74 | Cold | Band warning `You are cold. Seek shelter or a fire.` |
+| 75-99 | Freezing | Band warning `The cold is slowing you down. Seek shelter or a cooking fire.`; the `Chilled` aura in `survival` mode. |
+| 100 | Freezing | Same band warning; the `Chilled` aura and the health drain in `survival` mode, while the player stays exposed. |
+
+Cold runs from 0 (comfortable) to 100 (freezing). Its band thresholds are fixed and independent of `WarningThreshold` and `CriticalThreshold`: Chilly from 25, Cold from 50, Freezing from 75, which is also the aura threshold, and 100 is the drain threshold. Bands worsen immediately and improve only once the gauge falls strictly below the band's exit threshold minus `Hysteresis`, the same margin the other gauges use. A cold band warning is sent in both `advisory` and `survival`.
+
+### Exposure
+
+A player is *exposed* to cold when every one of these holds:
+
+- the zone is listed in `HungerThirst.ColdZones` (zone IDs, `1,65,67,210,618` by default) and the map is not an instance;
+- the player is outdoors: `Player::IsOutdoors()`, so any indoor area counts as shelter;
+- the player is not resting: `REST_FLAG_IN_TAVERN`, `REST_FLAG_IN_CITY` and `REST_FLAG_IN_FACTION_AREA` all count as shelter;
+- no warm fire is within 8 yards and in line of sight.
+
+A warm fire is a game object of type `GAMEOBJECT_TYPE_SPELL_FOCUS` whose `spellFocus.focusId` is 4, or any game object entry listed in `HungerThirst.ColdCampfireEntries`. The default list contains entry `2061` (`Campfire`), whose stock `spellFocus.focusId` is `0`, so the explicit entry is what makes the common campfire work; the focus-id check covers maps or custom data that use focus id 4. The fire probe visits the grid, so it is throttled to one check every 5 seconds while the player is outdoors in a cold zone: a fire reached, lit or put out is noticed within that window, and the first check after entering a cold zone can take up to 5 seconds.
+
+While exposed, the gauge gains `100 / ColdSeconds` points per second (600 seconds from 0 to 100 by default). Swimming doubles the rate (`Player::IsInWater`), so a river, lake or sea halves the effective exposure time. At any other moment - sheltered, near a fire, in a warm zone, in an instance - the gauge loses `100 / WarmSeconds` points per second (120 seconds from 100 back to 0 by default). Instances are excluded from exposure: inside a dungeon, raid or any other instanceable map the gauge warms at the normal rate, the `Chilled` aura is removed and the drain never runs.
+
+### Cold in survival mode
+
+In `survival` mode, with `ExposureEnable=1` and outside instances:
+
+- At 75 cold or more, the module applies the stock `Chilled` aura (spell 6136) and refreshes its 15-second duration on every active tick, so it never expires while the gauge stays at 75 or more. The module only manages its own copy: a `Chilled` aura cast by a creature is left untouched and a second copy is never stacked. The aura is removed when the gauge drops below 75, when the player leaves `survival`, when `ExposureEnable` becomes `0`, inside an instance, when the character is dead or out of the world, and on `reset` or character deletion.
+- At 100 cold, while the player is still exposed, health is drained every `ColdDrainIntervalMs` (5 seconds by default) by `ColdHealthDrainPct` of maximum health (1% by default). The drain stops at a floor of `ceil(maxHealth / 100)` health points (at least 1), so it can never kill the character on its own: there is no death cause, no death record and no death log. Time spent at 100 cold accumulates, so a long server tick applies every interval it covers up to the module's 10-second tick cap. The player is told once, when the drain starts, with `You are freezing: the cold is draining your health. Seek shelter or a fire immediately.`; the notice re-arms once the gauge drops below 100.
+- `ColdHealthDrainPct = 0` disables the drain and keeps the aura and the warnings.
+
+`advisory` mode simulates the gauge, sends the cold band warnings and reports the value to the command, the login summary and the addon, but never applies the `Chilled` aura and never drains health. In `off` mode the gauge is frozen and the aura is removed at the next tick. With `Enable=0` the state is not loaded at all.
+
+### Heat
+
+Hot zones have no gauge and no aura. When the zone is listed in `HungerThirst.HotZones` (`3,46,51,440,3483` by default), the map is not an instance, and the player is outdoors, not sheltered and not drinking, hydration loss is multiplied by `HotHydrationMultiplier` (2 by default); `1` disables the effect. *Drinking* means a drink or food-and-drink aura cast from an item (`SPELL_SPECIFIC_DRINK` or `SPELL_SPECIFIC_FOOD_AND_DRINK` with a cast item), so a normal drink stops the extra loss while it lasts.
+
+The hot flag is reported by the status command (`Hot zone: hydration drains faster.`), by the login summary and as field 11 of the addon protocol. The multiplier is applied to the same tick as the decay rates, after the rest and instance multipliers, and is skipped while a pause applies.
+
+### Disabling exposure
+
+`ExposureEnable = 0` freezes the cold gauge at its current value (no gain, no warming), removes the module's `Chilled` aura at the next tick, stops the health drain and disables the hot-zone multiplier. The stored value is kept and still reported. The switch is reloadable with `.reload config`.
 
 ## Persistence
 
@@ -245,7 +310,10 @@ State is stored in the `acore_characters` database, in the table `hunger_thirst_
 | `guid` | `INT UNSIGNED` (primary key) | Character low GUID. |
 | `satiety` | `DECIMAL(5,2)` | Satiety from 0 to 100, default `100.00`. |
 | `hydration` | `DECIMAL(5,2)` | Hydration from 0 to 100, default `100.00`. |
+| `cold` | `DECIMAL(5,2)` | Cold from 0 to 100, default `0.00`. |
 | `updated_at` | `BIGINT UNSIGNED` | Timestamp of the last save, in epoch milliseconds. |
+
+A table created by an earlier module version has no `cold` column. The module checks `information_schema` at startup and migrates it automatically with `ALTER TABLE hunger_thirst_state ADD COLUMN cold DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER hydration`, so no manual SQL is required. The column is then verified with `SELECT COUNT(cold)`, which is also the persistence readiness check.
 
 Writes are conditional on `updated_at`, so an older save never overwrites a newer one. State is loaded before the character enters the world, saved periodically with the character, saved synchronously on logout, and written synchronously by the `set` and `reset` commands. The row is deleted together with the character.
 
@@ -262,13 +330,13 @@ cp -r modules/mod-hunger-thirst/client/Interface/AddOns/HungerThirst \
       "/path/to/World of Warcraft/Interface/AddOns/"
 ```
 
-The addon displays the satiety and hydration gauges and their band labels. Apart from the aura tooltip override described below, it only reads the state sent by the server. It uses the `HT` addon prefix; `HungerThirst.AddonPrefix` must match the prefix configured in the addon. Slash commands:
+The addon displays the satiety, hydration and cold gauges and their band labels. Apart from the aura tooltip override described below, it only reads the state sent by the server. It uses the `HT` addon prefix; `HungerThirst.AddonPrefix` must match the prefix configured in the addon. Slash commands:
 
 - `/hungerthirst` or `/ht` shows or hides the gauge window.
 - `/hungerthirst reset` moves the window and the status icons back to their default positions and shows the window.
 - `/hungerthirst icons` shows or hides the status icons; the choice is saved.
 
-The window position, icon position and icon visibility are saved between sessions. The thirst states do not change the addon protocol, the gauge values or the band labels. The addon adds one client-side element: it replaces the tooltips of the four state auras, as described below.
+The window position, icon position and icon visibility are saved between sessions. The cold gauge and the hot flag are carried by the appended protocol fields described under [Protocol](#protocol); an older server that sends only eight fields leaves them at `0` (Comfortable) and off. The addon adds one client-side element: it replaces the tooltips of the four hunger and thirst state auras, as described below.
 
 ### Aura tooltips
 
@@ -284,27 +352,31 @@ Without the addon the Blizzard tooltip remains and the entry chat line is the au
 
 ### Protocol
 
-The server sends a `CHAT_MSG_WHISPER` / `LANG_ADDON` message directly to the player. The payload is the prefix followed by exactly eight tab-separated fields:
+The server sends a `CHAT_MSG_WHISPER` / `LANG_ADDON` message directly to the player. The payload is the prefix followed by exactly eleven tab-separated fields:
 
 ```text
-HT<TAB>satiety<TAB>hydration<TAB>mode<TAB>lethal<TAB>loaded<TAB>persistence<TAB>satBand<TAB>hydBand
+HT<TAB>satiety<TAB>hydration<TAB>mode<TAB>lethal<TAB>loaded<TAB>persistence<TAB>satBand<TAB>hydBand<TAB>cold<TAB>coldBand<TAB>hot
 ```
 
-- Satiety and hydration use one decimal.
+- Satiety, hydration and cold use one decimal.
 - Mode is `0` for `off`, `1` for `advisory` and `2` for `survival`.
-- Bands are `0` for normal, `1` for warning, `2` for critical and `3` for empty.
+- Hunger and thirst bands are `0` for normal, `1` for warning, `2` for critical and `3` for empty.
+- Cold band (`coldBand`) is `0` for Comfortable, `1` for Chilly, `2` for Cold and `3` for Freezing.
+- `hot` is `0` or `1`; it is `1` while the player is in a hot zone and takes the increased hydration loss.
 - `loaded` and `persistence` are `0` or `1`.
-- `lethal` is always `0`. The module no longer has a lethal model and never kills a character, but the field is kept in the payload, documented as reserved, so addons already installed on clients keep parsing the same eight fields and the same positions. It must not be interpreted as a gameplay flag anymore.
+- `lethal` is always `0`. The module has no lethal model, but the field is kept in the payload, documented as reserved, so addons keep parsing the same field positions. It must not be interpreted as a gameplay flag.
+
+The first eight fields keep their historical positions and meanings; `cold`, `coldBand` and `hot` are appended. An addon that only reads the first eight fields keeps working unchanged, and a message with eight fields leaves cold at `0` (Comfortable) and hot off in the current addon.
 
 There are no color codes.
 
-A login snapshot is sent immediately. In mode `off` it carries `mode=0` and no periodic updates follow. When the module is disabled, one synthetic snapshot tells the addon to display `Disabled`. When the state failed to load because persistence is unavailable, the snapshot reports `loaded=0` and `persistence=0`. Until any packet has been received, the addon stays on `Loading...`.
+A login snapshot is sent immediately. In mode `off` it carries `mode=0` and no periodic updates follow. When the module is disabled, one synthetic snapshot (`0.0<TAB>0.0<TAB>0<TAB>0<TAB>1<TAB>0<TAB>0<TAB>0<TAB>0.0<TAB>0<TAB>0` after the prefix) tells the addon to display `Disabled`. When the state failed to load because persistence is unavailable, the snapshot reports `loaded=0` and `persistence=0`. Until any packet has been received, the addon stays on `Loading...`.
 
 ### Status icons
 
-Two small status icons, one for satiety and one for hydration, are shown by default even when the gauge window is hidden. They sit at the bottom right of the screen, can be moved by dragging, and their position is saved. The border color indicates the band: gray for normal, yellow for warning, orange for critical and red for empty. The tooltip shows the value out of 100, the band and the active mode. A left click on either icon shows or hides the gauge window. The icons use only built-in 3.3.5a textures (`INV_Misc_Food_15` and `INV_Drink_05`); no custom texture or client patch is needed.
+Three small status icons, one for satiety, one for hydration and one for cold, are shown by default even when the gauge window is hidden. They sit at the bottom right of the screen, can be moved by dragging, and their position is saved. The border color indicates the band: gray for normal (Comfortable for cold), yellow for warning (Chilly), orange for critical (Cold) and red for empty (Freezing). The tooltip shows the value out of 100, the band and the active mode. A left click on any icon shows or hides the gauge window. The icons use only built-in 3.3.5a textures (`INV_Misc_Food_15`, `INV_Drink_05` and `Spell_Frost_ChillingArmor`); no custom texture or client patch is needed. The status line under the gauges reports the mode, `Not persisted` when the save is unavailable and `Hot` in a hot zone; the reserved lethal flag is never set by the server, so it never appears.
 
-Without the addon, everything remains functional through chat warnings, the hunger and thirst state debuffs, the login summary and the `.hungerthirst` command; the state tooltips then keep their original Blizzard text, and the entry chat line remains authoritative.
+Without the addon, everything remains functional through chat warnings, the hunger, thirst and cold debuffs, the login summary and the `.hungerthirst` command; the state tooltips then keep their original Blizzard text, and the entry chat line remains authoritative.
 
 ## Compatibility
 
@@ -313,18 +385,21 @@ Without the addon, everything remains functional through chat warnings, the hung
 - The mana-regeneration penalty relies on the canonical `SPELL_AURA_MOD_POWER_REGEN_PERCENT` aura only. No core patch is applied, so only the spirit-based regeneration portion is reduced; flat mana-per-5-seconds regeneration keeps its full value.
 - It uses public AzerothCore script hooks (world configuration and startup, player load/login/update/save/logout/delete, and aura apply) and its own `hunger_thirst_state` table. No core file is modified.
 - The configuration namespace (`HungerThirst.*`), the command (`.hungerthirst`) and the addon prefix (`HT`) are module-specific, so the module can be installed alongside other standalone modules.
-- There is no direct coupling with `mod-hardcore`. The module never resurrects a character, never writes a death table and never kills: thirst and hunger apply percentage penalties only, so no module-caused death can trigger a hardcore policy.
+- There is no direct coupling with `mod-hardcore`. The module never resurrects a character, never writes a death table and never kills: hunger and thirst apply percentage penalties only, and cold exposure drains health only down to a 1% floor with no death cause, so no module-caused death can trigger a hardcore policy.
+- Cold exposure applies the stock `Chilled` spell (6136) unchanged, without patching its data: no client patch, DBC edit or MPQ change is involved. Warm fires are detected from `gameobject_template` entries and the spell-focus id, so no new game object or area trigger is needed.
 - The module writes no death record and sends no global announcement. Its `LOG_INFO` and `LOG_DEBUG` output covers configuration, state persistence, consumable credits, state application and blur pulses only; there is no death line and no death history in the database.
 
 ## Limitations
 
-- The 3.3.5a client exposes no native hunger or thirst gauge. The visual display therefore depends on the optional addon; without it, only the state debuffs, chat messages and commands are available.
-- The state debuffs show a Blizzard spell name and icon, localized by the client. Their tooltips keep the original Blizzard descriptions, which describe unrelated effects and not the configured penalties; the real values and the remedy appear in the entry chat line, the configuration and this README. The optional addon overrides those four tooltips with the effects and the remedy, using the default percentages; without it the Blizzard text stays. No native server-side tooltip change is possible without a client patch. On the weakened hunger spell the client may briefly show the original short duration countdown, but the server keeps the aura as long as the state lasts.
+- The 3.3.5a client exposes no native hunger, thirst or cold gauge. The visual display therefore depends on the optional addon; without it, only the state debuffs, chat messages and commands are available.
+- The state debuffs show a Blizzard spell name and icon, localized by the client. Their tooltips keep the original Blizzard descriptions, which describe unrelated effects and not the configured penalties; the real values and the remedy appear in the entry chat line, the configuration and this README. The optional addon overrides those four tooltips with the effects and the remedy, using the default percentages; without it the Blizzard text stays. The `Chilled` aura uses the stock spell and tooltip as-is. No native server-side tooltip change is possible without a client patch. On the weakened hunger spell the client may briefly show the original short duration countdown, but the server keeps the aura as long as the state lasts.
 - The drinking blur depends on the client rendering the `PLAYER_FAKE_INEBRIATION` field without an aura. Its intensities (35 and 45) are deliberately kept below the client's drunk threshold (50) so the blur stays a screen tint and never triggers the drunk stance or its walk animation. The reported sliding walk was not caused by this field but by the stock client stun carried by the now-retired dehydrated spell 14870, which is why that spell was replaced by 5909; the dehydrated blur intensity stays at 45. If the field were ignored by a client, the fallback would be a short aura (`SPELL_AURA_MOD_FAKE_INEBRIATE` or `SPELL_AURA_SCREEN_EFFECT`), which briefly shows a debuff icon. No client patch or MPQ is used in either case.
 - The mana-regeneration penalty applies to the spirit-based regeneration only. The flat mana-per-5-seconds regeneration is unaffected in this core; reducing it would require a core change the module deliberately avoids.
 - The module ships with `Mode = off`. Without explicit configuration it has no gameplay effect.
 - The states exist only in `survival` mode. `HungerStates=0` leaves hunger with no gameplay effect; `ThirstStates=0` leaves hydration with no gameplay effect, no state and no blur. In both cases the corresponding band warnings are then not sent in `survival` (they remain available in `advisory`).
-- Thirst never damages or kills: there is no damage-per-hit setting and no lethal mode. Hydration at 0 only applies the dehydrated state. The same is true of hunger.
+- Hunger and thirst never damage or kill: there is no damage-per-hit setting and no lethal mode. Hydration at 0 only applies the dehydrated state, and satiety at 0 the starving state. Cold exposure is the only health drain: it removes `ColdHealthDrainPct` of maximum health per `ColdDrainIntervalMs` at 100 cold, stops at a floor of 1% of maximum health (at least 1 health point) and cannot kill the character on its own.
+- Cold and heat use static zone-ID lists (`ColdZones`, `HotZones`) and a game object probe. There is no weather, time-of-day or climate model; a zone is either cold, hot or neither, and a warm fire is a `SPELL_FOCUS` game object with focus id 4 or an entry listed in `ColdCampfireEntries`. Warm fires are only searched while the player is exposed in a cold zone, and the result is cached for 5 seconds.
+- The cold health drain only runs in `survival` mode and only while the player is still exposed at 100 cold: stepping indoors, resting or reaching a fire stops it immediately and starts warming. Any pause (taxi, battleground, arena, duel, dead, GM exemption) also stops the tick, so no drain occurs during it.
 - Well Fed buffs and similar auras do not restore the gauges. Only Food and Drink effects are credited, including food and drink items, feast or game object auras, and player-cast auras.
 - Gauges do not decay while the character is offline.
 - Commands work in game only, not from the server console.

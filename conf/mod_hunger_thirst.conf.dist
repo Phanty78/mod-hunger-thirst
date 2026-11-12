@@ -5,8 +5,10 @@
 #
 # Tracks satiety and hydration per character, warns the player as the gauges
 # fall and, in survival mode, applies hunger states from the satiety gauge and
-# thirst states from the hydration gauge. The module never deals damage and
-# never kills a character.
+# thirst states from the hydration gauge. Hunger and thirst cause no
+# exhaustion damage. Cold exposure adds a third gauge and is the only health
+# drain in the module: at 100 cold it removes health down to a 1 % max-health
+# floor, so it can never kill a character on its own.
 #
 # All player-facing messages (chat warnings, login summary, status command)
 # are in English.
@@ -67,8 +69,20 @@
 #     animation.
 #     No pulse is sent while a pause applies (see below) or once the state
 #     ends; a pulse in progress is cleared.
-#   - No exhaustion damage: thirst never removes health, and the module never
-#     causes a death (satiety and hydration alike).
+#   - Cold exposure (see the exposure keys below): Cold is a third gauge,
+#     0 (comfortable) to 100 (freezing). It is simulated in advisory and
+#     survival; the stock "Chilled" aura (spell 6136) and the health drain
+#     run in survival only, and instances are excluded from both. The gauge
+#     rises while the player is in a cold zone, outdoors, not resting and
+#     not within 8 yards of a warm fire; it falls otherwise. Bands are
+#     Chilly at 25, Cold at 50 and Freezing at 75, with Hysteresis on the
+#     way down. Hot zones have no gauge: they only multiply the hydration
+#     loss.
+#   - No exhaustion damage from hunger or thirst: neither gauge removes
+#     health. Cold exposure is the only drain: at 100 cold, and while still
+#     exposed, it removes ColdHealthDrainPct of maximum health per
+#     ColdDrainIntervalMs, stops at a floor of 1 % of maximum health and
+#     cannot kill the character on its own (no death cause, no death log).
 #
 # All changes can be applied with ".reload config"; they take effect at the
 # next tick. Two exceptions: HungerStatePenaltyPct,
@@ -91,7 +105,10 @@
 #   guid INT UNSIGNED PRIMARY KEY
 #   satiety DECIMAL(5,2) NOT NULL DEFAULT 100.00
 #   hydration DECIMAL(5,2) NOT NULL DEFAULT 100.00
+#   cold DECIMAL(5,2) NOT NULL DEFAULT 0.00
 #   updated_at BIGINT UNSIGNED NOT NULL DEFAULT 0 (epoch milliseconds)
+# Existing installations predate the cold column: the module adds it with
+# "ALTER TABLE ... ADD COLUMN cold" at startup, so no SQL file is needed.
 # Saves are conditional on updated_at, so an older save never overwrites a
 # newer one. If the table cannot be created or verified, the simulation is
 # suspended for the affected players: no tick (decay, warnings, states,
@@ -107,6 +124,12 @@
 #   - HungerStatePenaltyPct, HungerStarvingPenaltyPct,
 #     ThirstStatePenaltyPct and ThirstDehydratedPenaltyPct clamped to 0..90
 #   - all intervals/cooldowns >= 1000 ms
+#   - ColdSeconds and WarmSeconds clamped to >= 30 s
+#   - HotHydrationMultiplier clamped to 1..10
+#   - StartingCold and ColdHealthDrainPct clamped to 0..100
+#   - zone and gameobject ID lists are read as comma/space separated unsigned
+#     integers; reading stops at the first token that is not a number, and a
+#     value of 0 is dropped
 #   - ThirstBlurDurationMs clamped to >= 100 ms
 #   - all gauges/percentages/multipliers clamped to their documented range
 ########################################################################################################################
@@ -355,6 +378,117 @@ HungerThirst.ThirstBlurIntervalMs = 10000
 #
 HungerThirst.ThirstBlurDurationMs = 2000
 
+########################################################################
+# Cold and heat exposure
+#
+# Cold is a third gauge, 0 (comfortable) to 100 (freezing). The band labels
+# are Chilly from 25, Cold from 50 and Freezing from 75; Hysteresis applies
+# on the way down. The gauge is simulated in advisory and survival; the
+# 'Chilled' aura (spell 6136, refreshed every 15 s at 75 or more) and the
+# health drain apply in survival only. Instances are excluded: no cold gain,
+# no aura and no drain inside a dungeon, raid or other instanceable map.
+########################################################################
+
+#
+#    HungerThirst.ExposureEnable
+#        Master switch for cold and heat exposure. When 0 the cold gauge is
+#        frozen at its current value (no gain, no warming) and hot zones have
+#        no effect. The cold gauge is still persisted and reported.
+#        Default: 1
+#
+HungerThirst.ExposureEnable = 1
+
+#
+#    HungerThirst.StartingCold
+#        Cold assigned to a character with no stored row (new character or
+#        first login after installing the module), and the value restored by
+#        ".hungerthirst reset". Clamped to 0..100.
+#        Default: 0.00
+#
+HungerThirst.StartingCold = 0.00
+
+#
+#    HungerThirst.ColdZones
+#        Comma-separated zone IDs in which the cold gauge rises while the
+#        player is exposed. A player is exposed when in a cold zone, outdoors,
+#        not resting and not within 8 yards of a warm fire; indoors or
+#        resting (tavern, city, faction area) counts as shelter, and the
+#        player warms instead. Swimming doubles the cold gain. An empty value
+#        disables cold gain even when ExposureEnable=1.
+#        Default: "1,65,67,210,618"
+#
+HungerThirst.ColdZones = "1,65,67,210,618"
+
+#
+#    HungerThirst.HotZones
+#        Comma-separated zone IDs that count as hot. Heat has no gauge: while
+#        the player is in a hot zone, outdoors, not sheltered and not
+#        drinking, hydration loss is multiplied by HotHydrationMultiplier.
+#        An empty value disables the heat effect.
+#        Default: "3,46,51,440,3483"
+#
+HungerThirst.HotZones = "3,46,51,440,3483"
+
+#
+#    HungerThirst.ColdCampfireEntries
+#        Extra gameobject_template entries treated as a warm fire, on top of
+#        every SPELL_FOCUS game object whose focus id is 4. Entry 2061
+#        (Campfire) is listed explicitly because its stock focus id is 0, and
+#        the focus-id check is kept for maps or custom data that use focus
+#        id 4. A fire only counts within 8 yards and in line of sight. The
+#        probe is a grid visit, so it is cached for 5 seconds while the
+#        player is exposed in a cold zone.
+#        Default: "2061"
+#
+HungerThirst.ColdCampfireEntries = "2061"
+
+#
+#    HungerThirst.ColdSeconds
+#        Seconds needed to go from 0 to 100 cold while exposed. Swimming
+#        halves this effective time. Values below 30 are clamped to 30.
+#        Default: 600
+#
+HungerThirst.ColdSeconds = 600
+
+#
+#    HungerThirst.WarmSeconds
+#        Seconds needed to go from 100 cold back to 0 while warm or
+#        sheltered, that is whenever the player is not exposed. Values below
+#        30 are clamped to 30.
+#        Default: 120
+#
+HungerThirst.WarmSeconds = 120
+
+#
+#    HungerThirst.ColdDrainIntervalMs
+#        Survival only: milliseconds between two health drain ticks at 100
+#        cold while the player is still exposed. Time spent at 100 cold is
+#        accumulated, so a long tick applies the intervals it covers. Values
+#        below 1000 are clamped to 1000.
+#        Default: 5000
+#
+HungerThirst.ColdDrainIntervalMs = 5000
+
+#
+#    HungerThirst.ColdHealthDrainPct
+#        Survival only: percentage of maximum health removed per drain
+#        interval at 100 cold. The drain stops at a floor of 1 % of maximum
+#        health (at least 1 health point), so it cannot kill a character on
+#        its own: there is no death cause and no death log. 0 disables the
+#        drain while keeping the aura and the warnings. Clamped to 0..100.
+#        Default: 1.00
+#
+HungerThirst.ColdHealthDrainPct = 1.00
+
+#
+#    HungerThirst.HotHydrationMultiplier
+#        Hydration loss multiplier in a hot zone for a player who is
+#        outdoors, not sheltered and not drinking (a drink or food-and-drink
+#        aura cast from an item). Clamped to 1..10; 1 disables the effect.
+#        Default: 2.00
+#
+HungerThirst.HotHydrationMultiplier = 2.00
+
 #
 #    HungerThirst.FoodSatietyGain
 #        Satiety restored when a food aura is credited (spell specific FOOD or
@@ -423,8 +557,10 @@ HungerThirst.Hysteresis = 2.00
 
 #
 #    HungerThirst.ShowLoginSummary
-#        Send a one-line chat summary (mode, gauges, bands) on login
-#        when the module is enabled and not in mode off.
+#        Send a two-line chat summary on login: mode, satiety and hydration
+#        with their bands, then cold with its band and the hot-zone note.
+#        The cold band warning is restated when the gauge is at 25 or more.
+#        Skipped when the module is disabled or in mode off.
 #        Default: 1
 #
 HungerThirst.ShowLoginSummary = 1
@@ -446,13 +582,16 @@ HungerThirst.DebugLog = 0
 #        is a CHAT_MSG_WHISPER / LANG_ADDON message sent directly to the
 #        player:
 #
-#            HT<TAB>satiety<TAB>hydration<TAB>mode<TAB>lethal<TAB>loaded<TAB>persistence<TAB>satBand<TAB>hydBand
+#            HT<TAB>satiety<TAB>hydration<TAB>mode<TAB>lethal<TAB>loaded<TAB>persistence<TAB>satBand<TAB>hydBand<TAB>cold<TAB>coldBand<TAB>hot
 #
-#        The payload is the prefix plus exactly 8 fields (no extra field):
-#        satiety/hydration use one decimal; mode is 0=off, 1=advisory,
-#        2=survival; bands are 0=normal, 1=warning, 2=critical, 3=empty;
-#        lethal is reserved for addon compatibility and always sent as 0;
-#        loaded/persistence are 0/1. No colors.
+#        The payload is the prefix plus exactly 11 fields: the first eight
+#        keep their historical positions, and cold, coldBand and hot are
+#        appended, so an older addon that ignores extra fields keeps working.
+#        satiety/hydration/cold use one decimal; mode is 0=off, 1=advisory,
+#        2=survival; hunger/thirst bands are 0=normal, 1=warning, 2=critical,
+#        3=empty; coldBand is 0=comfortable, 1=chilly, 2=cold, 3=freezing;
+#        hot is 0/1; lethal is reserved for addon compatibility and always
+#        sent as 0; loaded/persistence are 0/1. No colors.
 #        Default: 1
 #
 HungerThirst.AddonEnable = 1
